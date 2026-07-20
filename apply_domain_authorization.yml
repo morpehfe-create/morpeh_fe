@@ -136,6 +136,7 @@
         url: "{{ baseuri }}/redfish/v1/Managers"
         method: GET
         return_content: true
+        timeout: 10
         status_code: 200
       register: ipmi_managers_autodetect
       changed_when: false
