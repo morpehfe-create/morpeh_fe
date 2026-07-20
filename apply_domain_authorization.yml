@@ -89,11 +89,11 @@
 
 
     # ----------------------------------------------------------------------
-    # Задача: Get IPMI redirect location
-    # Сначала обращаемся к IPMI по обычному HTTP без авторизации и не переходим по редиректу.
-    # Если IPMI перенаправляет web-интерфейс на нестандартный HTTPS-порт, адрес берётся из заголовка Location.
-    # При недоступном HTTP или отсутствии редиректа дальше используется стандартный адрес https://IP:443.
-    - name: Get IPMI redirect location
+    # Задача: Get redirect location
+    # Обращаемся к IPMI по обычному HTTP без авторизации и не переходим по редиректу.
+    # Хосты с нестандартным HTTPS-портом возвращают полный адрес в заголовке Location.
+    # Хосты без редиректа обычно возвращают HTTP 200.
+    - name: Get redirect location
       ansible.builtin.uri:
         url: "http://{{ inventory_hostname }}"
         method: GET
@@ -109,48 +109,19 @@
           - 303
           - 307
           - 308
-      register: ipmi_redirect_info
+      register: redirect_info
       changed_when: false
-      failed_when: false
 
 
     # ----------------------------------------------------------------------
-    # Задача: Set IPMI base URL and HTTPS port
-    # Из полного адреса редиректа оставляем только протокол, IP/имя и порт.
-    # Например, https://10.145.100.22:8443/login.html превращается в https://10.145.100.22:8443.
-    # Все последующие Redfish, RIBCL и iLO4 web-запросы используют ipmi_base_url.
-    - name: Set IPMI base URL and HTTPS port
+    # Задача: Set IPMI base URI and HTTPS port
+    # Если Location есть, сохраняем полный HTTPS-адрес из редиректа.
+    # Если Location нет, используем стандартный адрес https://IP.
+    # Завершающий слеш удаляется, чтобы при добавлении Redfish-пути не получить двойной //.
+    - name: Set IPMI base URI and HTTPS port
       ansible.builtin.set_fact:
-        ipmi_base_url: >-
-          {{
-            (
-              (ipmi_redirect_info.location | ansible.builtin.urlsplit('scheme'))
-              ~ '://'
-              ~ (ipmi_redirect_info.location | ansible.builtin.urlsplit('netloc'))
-            )
-            if (
-              (ipmi_redirect_info.status | default(0) | int) in [301, 302, 303, 307, 308]
-              and (ipmi_redirect_info.location | default('') | length > 0)
-              and ((ipmi_redirect_info.location | ansible.builtin.urlsplit('scheme')) == 'https')
-              and ((ipmi_redirect_info.location | ansible.builtin.urlsplit('netloc')) | length > 0)
-            )
-            else 'https://' ~ inventory_hostname
-          }}
-        ipmi_https_port: >-
-          {{
-            (
-              ipmi_redirect_info.location
-              | ansible.builtin.urlsplit('port')
-              | default(443, true)
-            )
-            if (
-              (ipmi_redirect_info.status | default(0) | int) in [301, 302, 303, 307, 308]
-              and (ipmi_redirect_info.location | default('') | length > 0)
-              and ((ipmi_redirect_info.location | ansible.builtin.urlsplit('scheme')) == 'https')
-              and ((ipmi_redirect_info.location | ansible.builtin.urlsplit('netloc')) | length > 0)
-            )
-            else 443
-          }}
+        baseuri: "{{ redirect_info.location | default('https://' ~ inventory_hostname, true) | regex_replace('/$', '') }}"
+        ipmi_https_port: "{{ (redirect_info.location | default('https://' ~ inventory_hostname, true) | ansible.builtin.urlsplit('port')) | default(443, true) }}"
 
 
     # ----------------------------------------------------------------------
@@ -160,7 +131,7 @@
     # Если Redfish недоступен, текущий хост завершается с ошибкой и остальные хосты продолжают работу.
     - name: Read IPMI Managers collection
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers"
+        url: "{{ baseuri }}/redfish/v1/Managers"
         method: GET
         return_content: true
         status_code: 200
@@ -176,7 +147,7 @@
     - name: Read IPMI Manager resource for autodetect
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             ipmi_managers_autodetect.json.Members[0]['@odata.id']
           }}
         method: GET
@@ -193,7 +164,7 @@
     # Для HPE там отличаются старые iLO4 и новые iLO5 LDAP/Directory структуры, это помогает точнее определить тип IPMI.
     - name: Read IPMI AccountService for autodetect
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/AccountService/"
+        url: "{{ baseuri }}/redfish/v1/AccountService/"
         method: GET
         return_content: true
         status_code:
@@ -256,7 +227,7 @@
     - name: Read HPE Manager EthernetInterfaces collection
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             ipmi_manager_autodetect.json.EthernetInterfaces['@odata.id']
           }}
         method: GET
@@ -274,7 +245,7 @@
     - name: Read HPE Manager EthernetInterface resource
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             hpe_eth_collection.json.Members[0]['@odata.id']
           }}
         method: GET
@@ -310,7 +281,7 @@
     # Выключаем DHCP DNS, WINS, DHCPv6, SLAAC и DDNS; прописываем статические DNS-серверы из раздела vars в начале playbook.
     - name: Configure DNS, DDNS, WINS and IPv6 off for HPE iLO5 via Redfish
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}{{ hpe_eth_patch_uri }}"
+        url: "{{ baseuri }}{{ hpe_eth_patch_uri }}"
         method: PATCH
         body_format: json
         body:
@@ -358,7 +329,7 @@
     # Redfish не всегда снимает эту галку, поэтому используется старый HPE RIBCL XML endpoint.
     - name: Disable IPv6 preferred protocol for HPE iLO5 via RIBCL
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -401,7 +372,7 @@
     # Это предварительный шаг перед RIBCL, потому что у iLO4 часть сетевых параметров лучше применяется через разные механизмы.
     - name: Disable DHCP DNS flag for HPE iLO4 via Redfish
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}{{ hpe_eth_patch_uri }}"
+        url: "{{ baseuri }}{{ hpe_eth_patch_uri }}"
         method: PATCH
         body_format: json
         body:
@@ -424,7 +395,7 @@
     # Прописываем статические DNS, выключаем DHCP DNS, WINS registration, DDNS и IPv6/DHCPv6 настройки.
     - name: Configure static DNS, DDNS and IPv6 off for HPE iLO4 via RIBCL
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -482,7 +453,7 @@
     # У iLO4 часть параметров сети и IPv6 применяются только после reset самого iLO, не сервера.
     - name: Reset HPE iLO4 after IPv6 and DHCP SNTP changes
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -524,7 +495,7 @@
     # Фэйлит текущий хост, если после промежуточного reset Redfish не вернулся.
     - name: Verify HPE iLO4 Redfish after network reset
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/"
+        url: "{{ baseuri }}/redfish/v1/"
         method: GET
         status_code: 200
       register: hpe_ilo4_redfish_after_network_reset
@@ -541,7 +512,7 @@
     # Для Supermicro оставляем только primary DNS одной строкой, потому что второй DNS/массив на этой модели может ломать IPMI.
     - name: Configure DNS for Supermicro via Redfish
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers/1/EthernetInterfaces/1"
+        url: "{{ baseuri }}/redfish/v1/Managers/1/EthernetInterfaces/1"
         method: PATCH
         body_format: json
         body:
@@ -558,7 +529,7 @@
     # Если прошивка не принимает хотя бы одно свойство, задача завершается ошибкой для этого IPMI.
     - name: Disable all IPv6 for Supermicro via Redfish
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers/1/EthernetInterfaces/1"
+        url: "{{ baseuri }}/redfish/v1/Managers/1/EthernetInterfaces/1"
         method: PATCH
         body_format: json
         body:
@@ -584,7 +555,7 @@
     # Повторно читаем сетевой интерфейс и проверяем три ключевых признака отключения IPv6.
     - name: Verify IPv6 is disabled for Supermicro
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers/1/EthernetInterfaces/1"
+        url: "{{ baseuri }}/redfish/v1/Managers/1/EthernetInterfaces/1"
         method: GET
         return_content: true
         status_code: 200
@@ -607,7 +578,7 @@
     # Если конкретная прошивка не принимает этот PATCH и даёт 400, ниже есть fallback на прямой интерфейс.
     - name: Disable DHCP-provided NTP servers on HPE iLO5 EthernetInterface settings URI
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}{{ hpe_eth_patch_uri }}"
+        url: "{{ baseuri }}{{ hpe_eth_patch_uri }}"
         method: PATCH
         body_format: json
         body:
@@ -635,7 +606,7 @@
     - name: Disable DHCP-provided NTP servers on HPE iLO5 EthernetInterface direct URI fallback
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             hpe_eth_collection.json.Members[0]['@odata.id']
           }}
         method: PATCH
@@ -663,7 +634,7 @@
     - name: Configure NTP servers and Time Zone for HPE iLO5 via Redfish
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             ipmi_manager_autodetect.json['@odata.id'] | regex_replace('/$', '')
           }}/DateTime
         method: PATCH
@@ -687,7 +658,7 @@
     # Отключаем DHCP SNTP, прописываем два NTP/SNTP сервера и timezone из переменной ipmi_ilo4_timezone.
     - name: Configure SNTP servers and Time Zone for HPE iLO4 via RIBCL
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -724,7 +695,7 @@
     # Включаем NTP, прописываем primary/secondary серверы и выключаем DaylightSavingTime.
     - name: Configure NTP for Supermicro via Redfish
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers/1/NTP"
+        url: "{{ baseuri }}/redfish/v1/Managers/1/NTP"
         method: PATCH
         body_format: json
         body:
@@ -745,7 +716,7 @@
     - name: Configure Time Zone UTC+05:00 for Supermicro via Redfish
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             ipmi_manager_autodetect.json['@odata.id']
           }}
         method: PATCH
@@ -769,7 +740,7 @@
     - name: Import LDAP CA certificate for HPE iLO5
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             ipmi_accountservice_autodetect.json.Oem.Hpe.DirectorySettings.LdapCaCertificates['@odata.id']
           }}
         method: POST
@@ -799,7 +770,7 @@
     # Указываем LDAPService, включаем сервис и задаём Directory Server Address из раздела vars в начале playbook.
     - name: Enable Generic LDAP authentication over LDAPS for HPE iLO5
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/AccountService/"
+        url: "{{ baseuri }}/redfish/v1/AccountService/"
         method: PATCH
         body_format: json
         body:
@@ -821,7 +792,7 @@
     # Это нужно, чтобы вход по user@nls.local не дополнялся лишним Base DN/User Context.
     - name: Clear Generic LDAP User Contexts for HPE iLO5
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/AccountService/"
+        url: "{{ baseuri }}/redfish/v1/AccountService/"
         method: PATCH
         body_format: json
         body:
@@ -843,7 +814,7 @@
     # RemoteGroup указывается как DN группы плюс SID, чтобы iLO корректно авторизовал членов группы.
     - name: Configure Generic LDAP group mapping for HPE iLO5
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/AccountService/"
+        url: "{{ baseuri }}/redfish/v1/AccountService/"
         method: PATCH
         body_format: json
         body:
@@ -864,7 +835,7 @@
     # Включаем Directory, оставляем локальные учётки, задаём сервер LDAP/LDAPS, порт, DN группы, SID и права 1-6.
     - name: Configure Directory and group for HPE iLO4 via RIBCL
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -914,7 +885,7 @@
     # Это нужно, чтобы доменный логин не ломался из-за старого/лишнего контекста пользователя.
     - name: Clear Directory User Context 1 for HPE iLO4 via RIBCL
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -959,7 +930,7 @@
     # BasicAuth здесь специально отключён, потому что /json/login_session использует web-session механизм, а не Redfish BasicAuth.
     - name: Login to HPE iLO4 web session for LDAP CA import
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/json/login_session"
+        url: "{{ baseuri }}/json/login_session"
         method: POST
         validate_certs: false
         url_username: ""
@@ -970,8 +941,8 @@
           Accept: "application/json, text/javascript, */*; q=0.01"
           Content-Type: "application/json; charset=UTF-8"
           X-Requested-With: "XMLHttpRequest"
-          Origin: "{{ ipmi_base_url }}"
-          Referer: "{{ ipmi_base_url }}/"
+          Origin: "{{ baseuri }}"
+          Referer: "{{ baseuri }}/"
         body:
           method: "login"
           user_login: "{{ ipmi_login }}"
@@ -1058,7 +1029,7 @@
     # У iLO4 старый Redfish не умеет нормальный CA import, поэтому используется /json/directory с ca_cert_data.
     - name: Import LDAP CA certificate for HPE iLO4 via web UI endpoint
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/json/directory"
+        url: "{{ baseuri }}/json/directory"
         method: POST
         validate_certs: false
         url_username: ""
@@ -1069,8 +1040,8 @@
           Accept: "application/json, text/javascript, */*; q=0.01"
           Content-Type: "application/json; charset=UTF-8"
           X-Requested-With: "XMLHttpRequest"
-          Origin: "{{ ipmi_base_url }}"
-          Referer: "{{ ipmi_base_url }}/html/admin_security_directory.html"
+          Origin: "{{ baseuri }}"
+          Referer: "{{ baseuri }}/html/admin_security_directory.html"
           Cookie: "sessionKey={{ hpe_ilo4_web_session_key }}"
         body:
           method: "mod_dir_config"
@@ -1100,7 +1071,7 @@
     # Это уменьшает количество зависших сессий в iLO web backend.
     - name: Logout from HPE iLO4 web session after LDAP CA import
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/json/login_session"
+        url: "{{ baseuri }}/json/login_session"
         method: POST
         validate_certs: false
         url_username: ""
@@ -1134,7 +1105,7 @@
     # Важно делать это после CA import, потому что /json/directory может пересохранить форму Directory и сбросить чекбокс Generic LDAP.
     - name: Enable Generic LDAP for HPE iLO4 via RIBCL
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -1177,7 +1148,7 @@
     # Этот read-only шаг нужен, чтобы проверить фактическое состояние, а не верить только changed от RIBCL.
     - name: Read Directory config after Generic LDAP enable for HPE iLO4
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -1222,7 +1193,7 @@
     # Включаем AD auth over SSL, порт 636, домен и адреса DC.
     - name: Configure Active Directory for Supermicro via Redfish
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers/1/ActiveDirectory"
+        url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory"
         method: PATCH
         body_format: json
         body:
@@ -1247,7 +1218,7 @@
     # Нужно понять, создавать новую группу или обновлять уже существующую.
     - name: Read Active Directory RoleGroups for Supermicro
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers/1/ActiveDirectory/RoleGroups"
+        url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory/RoleGroups"
         method: GET
         return_content: true
         status_code: 200
@@ -1261,7 +1232,7 @@
     # Используем короткое имя группы ipmi_oor, домен nls.local и привилегию Administrator.
     - name: Create Active Directory RoleGroup for Supermicro
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/Managers/1/ActiveDirectory/RoleGroups"
+        url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory/RoleGroups"
         method: POST
         body_format: json
         body:
@@ -1283,7 +1254,7 @@
     # Это нужно, если группа уже создана, но надо привести её имя/домен/права к нужному состоянию.
     - name: Update Active Directory RoleGroup for Supermicro
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}{{ smc_ad_rolegroups.json.Members[0]['@odata.id'] }}"
+        url: "{{ baseuri }}{{ smc_ad_rolegroups.json.Members[0]['@odata.id'] }}"
         method: PATCH
         body_format: json
         body:
@@ -1310,7 +1281,7 @@
     - name: Reset HPE iLO5 after network and directory changes
       ansible.builtin.uri:
         url: >-
-          {{ ipmi_base_url }}{{
+          {{ baseuri }}{{
             ipmi_manager_autodetect.json['@odata.id'] | regex_replace('/$', '')
           }}/Actions/Manager.Reset/
         method: POST
@@ -1344,7 +1315,7 @@
     # Проверяем не только открытый TCP 443, но и готовность Redfish API.
     - name: Verify HPE iLO5 Redfish after reset
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/"
+        url: "{{ baseuri }}/redfish/v1/"
         method: GET
         status_code: 200
       register: hpe_ilo5_redfish_ready
@@ -1361,7 +1332,7 @@
     # Это применяет Directory, Generic LDAP, SNTP и сетевые параметры iLO4.
     - name: Reset HPE iLO4 after RIBCL changes
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/ribcl"
+        url: "{{ baseuri }}/ribcl"
         method: POST
         headers:
           Accept: "*/*"
@@ -1407,7 +1378,7 @@
     # После финального reset проверяем, что Redfish API реально отвечает HTTP 200.
     - name: Verify HPE iLO4 Redfish after reset
       ansible.builtin.uri:
-        url: "{{ ipmi_base_url }}/redfish/v1/"
+        url: "{{ baseuri }}/redfish/v1/"
         method: GET
         status_code: 200
       register: hpe_ilo4_redfish_ready
