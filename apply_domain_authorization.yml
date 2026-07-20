@@ -93,6 +93,7 @@
     # Обращаемся к IPMI по обычному HTTP без авторизации и не переходим по редиректу.
     # Хосты с нестандартным HTTPS-портом возвращают полный адрес в заголовке Location.
     # Хосты без редиректа обычно возвращают HTTP 200.
+    # Любой другой HTTP-код, тайм-аут или ошибка подключения помечают этот хост как FAILED.
     - name: Get redirect location
       ansible.builtin.uri:
         url: "http://{{ inventory_hostname }}"
@@ -102,6 +103,7 @@
         force_basic_auth: false
         follow_redirects: none
         return_content: false
+        timeout: 5
         status_code:
           - 200
           - 301
