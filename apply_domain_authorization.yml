@@ -1,5 +1,5 @@
-# Playbook: Apply BMC DNS, NTP and Directory settings
-# Назначение: автоматически определить тип BMC по Redfish и применить нужные настройки
+# Playbook: Apply IPMI DNS, NTP and Directory settings
+# Назначение: автоматически определить тип IPMI по Redfish и применить нужные настройки
 # для HPE iLO4, HPE iLO5 и Supermicro без указания vendor/model в inventory.
 #
 # Inventory может содержать только IP-адреса. Креды берутся из vault.yml:
@@ -8,11 +8,11 @@
 #
 # Комментарии перед каждой задачей описывают, зачем нужен шаг и что он меняет.
 ---
-- name: Apply BMC DNS, NTP and Directory settings
+- name: Apply IPMI DNS, NTP and Directory settings
   hosts: ipmi_test
   gather_facts: false
   connection: local
-  serial: 1
+  strategy: free
 
   vars_files:
     - /etc/ansible/vault.yml
@@ -34,8 +34,11 @@
     ipmi_ilo5_timezone_index: 22
     ipmi_ilo4_timezone: "Asia/Aqtobe"
 
-    # Часовой пояс Supermicro. Redfish принимает смещение в формате +HH:MM; +00:00 соответствует UTC+00:00.
+    # Часовой пояс Supermicro. Redfish принимает смещение в формате +HH:MM; +05:00 соответствует UTC+05:00.
     ipmi_supermicro_timezone: "+05:00"
+
+    # Режим сетевого стека Supermicro: только IPv4, весь IPv6 отключён.
+    ipmi_supermicro_ip_protocol: "IPv4"
 
     # Параметры LDAP/LDAPS и доменной группы.
     ipmi_directory_server: "nls.local"
@@ -86,58 +89,43 @@
 
 
     # ----------------------------------------------------------------------
-    # Задача: Read BMC Managers collection
+    # Задача: Read IPMI Managers collection
     # Первичный опрос Redfish на каждом IP из inventory.
-    # Результат сразу сохраняется в bmc_managers_autodetect и затем используется для автоопределения BMC.
-    - name: Read BMC Managers collection
+    # Результат сразу сохраняется в ipmi_managers_autodetect и затем используется для автоопределения IPMI.
+    - name: Read IPMI Managers collection
       ansible.builtin.uri:
         url: "https://{{ inventory_hostname }}/redfish/v1/Managers"
         method: GET
         return_content: true
-        status_code:
-          - 200
-          - 401
-          - 403
-          - 404
-          - 500
-      register: bmc_managers_autodetect
+        status_code: 200
+      register: ipmi_managers_autodetect
       changed_when: false
-      failed_when: false
       no_log: true
 
 
     # ----------------------------------------------------------------------
-    # Задача: Skip hosts without accessible Redfish Managers collection
-    # Если Redfish Managers не открылся с HTTP 200, этот хост пропускается.
-    # Это защита от не-BMC устройств, выключенных адресов или хостов с неверными кредами.
-    - name: Skip hosts without accessible Redfish Managers collection
-      ansible.builtin.meta: end_host
-      when: (bmc_managers_autodetect.status | default(0)) != 200
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Read BMC Manager resource for autodetect
+    # Задача: Read IPMI Manager resource for autodetect
     # Читаем основной ресурс Manager.
     # В нём есть Name, Model, FirmwareVersion, ManagerType и OEM-блоки, по которым определяется iLO4/iLO5/Supermicro.
-    - name: Read BMC Manager resource for autodetect
+    - name: Read IPMI Manager resource for autodetect
       ansible.builtin.uri:
         url: >-
           https://{{ inventory_hostname }}{{
-            bmc_managers_autodetect.json.Members[0]['@odata.id']
+            ipmi_managers_autodetect.json.Members[0]['@odata.id']
           }}
         method: GET
         return_content: true
         status_code: 200
-      register: bmc_manager_autodetect
+      register: ipmi_manager_autodetect
       changed_when: false
       no_log: true
 
 
     # ----------------------------------------------------------------------
-    # Задача: Read BMC AccountService for autodetect
+    # Задача: Read IPMI AccountService for autodetect
     # Дополнительно читаем AccountService.
-    # Для HPE там отличаются старые iLO4 и новые iLO5 LDAP/Directory структуры, это помогает точнее определить тип BMC.
-    - name: Read BMC AccountService for autodetect
+    # Для HPE там отличаются старые iLO4 и новые iLO5 LDAP/Directory структуры, это помогает точнее определить тип IPMI.
+    - name: Read IPMI AccountService for autodetect
       ansible.builtin.uri:
         url: "https://{{ inventory_hostname }}/redfish/v1/AccountService/"
         method: GET
@@ -145,26 +133,25 @@
         status_code:
           - 200
           - 404
-      register: bmc_accountservice_autodetect
+      register: ipmi_accountservice_autodetect
       changed_when: false
-      failed_when: false
       no_log: true
 
 
     # ----------------------------------------------------------------------
-    # Задача: Detect BMC type
+    # Задача: Detect IPMI type
     # Определяем тип устройства без переменных в inventory.
     # Если в ответах есть признаки Supermicro — выбираем supermicro; признаки iLO5 — ilo5; старые HP/iLO4 признаки — ilo4.
-    - name: Detect BMC type
+    - name: Detect IPMI type
       ansible.builtin.set_fact:
-        bmc_detected_type: >-
+        ipmi_detected_type: >-
           {%- set text          = (
-            ((bmc_manager_autodetect.json | default({})) | to_json)
+            ((ipmi_manager_autodetect.json | default({})) | to_json)
             ~ ' '
-            ~ ((bmc_accountservice_autodetect.json | default({})) | to_json)
+            ~ ((ipmi_accountservice_autodetect.json | default({})) | to_json)
           ) | lower -%}
           {%- set oem = (
-            (bmc_manager_autodetect.json.Oem | default({})).keys()
+            (ipmi_manager_autodetect.json.Oem | default({})).keys()
             | list
             | map('lower')
             | list
@@ -181,12 +168,15 @@
 
 
     # ----------------------------------------------------------------------
-    # Задача: Skip unsupported BMC devices
-    # Если тип устройства не поддерживается, завершаем выполнение только для этого хоста.
-    # Остальные IP из inventory продолжают обрабатываться.
-    - name: Skip unsupported BMC devices
-      ansible.builtin.meta: end_host
-      when: bmc_detected_type == 'unsupported'
+    # Задача: Fail unsupported IPMI devices
+    # Если тип устройства не поддерживается, текущий хост завершается со статусом failed.
+    # Остальные IP из inventory продолжают выполняться независимо.
+    - name: Fail unsupported IPMI devices
+      ansible.builtin.fail:
+        msg: >-
+          IPMI {{ inventory_hostname }} не распознан как поддерживаемый тип:
+          HPE iLO4, HPE iLO5 или Supermicro.
+      when: ipmi_detected_type == 'unsupported'
 
     ###########################################################################
     # HPE discovery
@@ -201,14 +191,14 @@
       ansible.builtin.uri:
         url: >-
           https://{{ inventory_hostname }}{{
-            bmc_manager_autodetect.json.EthernetInterfaces['@odata.id']
+            ipmi_manager_autodetect.json.EthernetInterfaces['@odata.id']
           }}
         method: GET
         return_content: true
         status_code: 200
       register: hpe_eth_collection
       changed_when: false
-      when: bmc_detected_type in ['ilo4', 'ilo5']
+      when: ipmi_detected_type in ['ilo4', 'ilo5']
 
 
     # ----------------------------------------------------------------------
@@ -226,7 +216,7 @@
         status_code: 200
       register: hpe_eth_current
       changed_when: false
-      when: bmc_detected_type in ['ilo4', 'ilo5']
+      when: ipmi_detected_type in ['ilo4', 'ilo5']
 
 
     # ----------------------------------------------------------------------
@@ -241,7 +231,7 @@
             if ('@Redfish.Settings' in hpe_eth_current.json and 'SettingsObject' in hpe_eth_current.json['@Redfish.Settings'])
             else hpe_eth_collection.json.Members[0]['@odata.id']
           }}
-      when: bmc_detected_type in ['ilo4', 'ilo5']
+      when: ipmi_detected_type in ['ilo4', 'ilo5']
 
     ###########################################################################
     # Network / DNS / DDNS / WINS / IPv6
@@ -293,7 +283,7 @@
           - 200
           - 202
           - 204
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -336,7 +326,7 @@
         hpe_ipv6_preferred_ribcl_ilo5.status != 200 or
         ('0x0000' not in (hpe_ipv6_preferred_ribcl_ilo5.content | default('')))
       no_log: true
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -359,7 +349,7 @@
           - 200
           - 202
           - 204
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -417,7 +407,7 @@
         hpe_dns_ribcl_ilo4.status != 200 or
         ('0x0000' not in (hpe_dns_ribcl_ilo4.content | default('')))
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -446,7 +436,7 @@
       failed_when: false
       changed_when: true
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -460,13 +450,29 @@
         delay: 25
         timeout: 180
         state: started
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
+
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify HPE iLO4 Redfish after network reset
+    # Фэйлит текущий хост, если после промежуточного reset Redfish не вернулся.
+    - name: Verify HPE iLO4 Redfish after network reset
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/redfish/v1/"
+        method: GET
+        status_code: 200
+      register: hpe_ilo4_redfish_after_network_reset
+      retries: 18
+      delay: 10
+      until: hpe_ilo4_redfish_after_network_reset.status == 200
+      changed_when: false
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
     # Задача: Configure DNS for Supermicro via Redfish
     # Настраиваем DNS на Supermicro через Redfish.
-    # Для Supermicro оставляем только primary DNS одной строкой, потому что второй DNS/массив на этой модели может ломать BMC.
+    # Для Supermicro оставляем только primary DNS одной строкой, потому что второй DNS/массив на этой модели может ломать IPMI.
     - name: Configure DNS for Supermicro via Redfish
       ansible.builtin.uri:
         url: "https://{{ inventory_hostname }}/redfish/v1/Managers/1/EthernetInterfaces/1"
@@ -477,7 +483,52 @@
         status_code:
           - 200
           - 204
-      when: bmc_detected_type == 'supermicro'
+      when: ipmi_detected_type == 'supermicro'
+
+
+    # ----------------------------------------------------------------------
+    # Задача: Disable all IPv6 for Supermicro via Redfish
+    # Переводим сетевой стек Supermicro в режим IPv4, отключаем DHCPv6 и SLAAC.
+    # Если прошивка не принимает хотя бы одно свойство, задача завершается ошибкой для этого IPMI.
+    - name: Disable all IPv6 for Supermicro via Redfish
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/redfish/v1/Managers/1/EthernetInterfaces/1"
+        method: PATCH
+        body_format: json
+        body:
+          DHCPv6:
+            OperatingMode: "Disabled"
+            UseDNSServers: false
+            UseDomainName: false
+            UseNTPServers: false
+            UseRapidCommit: false
+          StatelessAddressAutoConfig:
+            IPv6AutoConfigEnabled: false
+          Oem:
+            Supermicro:
+              IPProtocolStatus: "{{ ipmi_supermicro_ip_protocol }}"
+        status_code:
+          - 200
+          - 204
+      when: ipmi_detected_type == 'supermicro'
+
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify IPv6 is disabled for Supermicro
+    # Повторно читаем сетевой интерфейс и проверяем три ключевых признака отключения IPv6.
+    - name: Verify IPv6 is disabled for Supermicro
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/redfish/v1/Managers/1/EthernetInterfaces/1"
+        method: GET
+        return_content: true
+        status_code: 200
+      register: ipmi_supermicro_ipv6_verify
+      changed_when: false
+      failed_when: >
+        ipmi_supermicro_ipv6_verify.json.DHCPv6.OperatingMode | default('') != 'Disabled' or
+        ipmi_supermicro_ipv6_verify.json.StatelessAddressAutoConfig.IPv6AutoConfigEnabled | default(true) | bool or
+        ipmi_supermicro_ipv6_verify.json.Oem.Supermicro.IPProtocolStatus | default('') != ipmi_supermicro_ip_protocol
+      when: ipmi_detected_type == 'supermicro'
 
     ###########################################################################
     # NTP / SNTP / Time Zone
@@ -508,7 +559,7 @@
       register: hpe_ntp_dhcp_patch_ilo5
       failed_when: hpe_ntp_dhcp_patch_ilo5.status not in [200, 202, 204, 400]
       changed_when: hpe_ntp_dhcp_patch_ilo5.status in [200, 202, 204]
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -535,7 +586,7 @@
           - 202
           - 204
       when:
-        - bmc_detected_type == 'ilo5'
+        - ipmi_detected_type == 'ilo5'
         - hpe_ntp_dhcp_patch_ilo5.status == 400
 
 
@@ -547,7 +598,7 @@
       ansible.builtin.uri:
         url: >-
           https://{{ inventory_hostname }}{{
-            bmc_manager_autodetect.json['@odata.id'] | regex_replace('/$', '')
+            ipmi_manager_autodetect.json['@odata.id'] | regex_replace('/$', '')
           }}/DateTime
         method: PATCH
         body_format: json
@@ -561,7 +612,7 @@
           - 200
           - 202
           - 204
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -598,7 +649,7 @@
         hpe_sntp_ribcl_ilo4.status != 200 or
         ('0x0000' not in (hpe_sntp_ribcl_ilo4.content | default('')))
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -618,18 +669,18 @@
         status_code:
           - 200
           - 204
-      when: bmc_detected_type == 'supermicro'
+      when: ipmi_detected_type == 'supermicro'
 
 
     # ----------------------------------------------------------------------
     # Задача: Configure Time Zone for Supermicro via Redfish
-    # Выставляем для Supermicro смещение локального времени UTC+00:00.
+    # Выставляем для Supermicro смещение локального времени UTC+05:00.
     # Redfish Manager принимает значение DateTimeLocalOffset в формате +HH:MM.
-    - name: Configure Time Zone UTC+00:00 for Supermicro via Redfish
+    - name: Configure Time Zone UTC+05:00 for Supermicro via Redfish
       ansible.builtin.uri:
         url: >-
           https://{{ inventory_hostname }}{{
-            bmc_manager_autodetect.json['@odata.id']
+            ipmi_manager_autodetect.json['@odata.id']
           }}
         method: PATCH
         body_format: json
@@ -638,7 +689,7 @@
         status_code:
           - 200
           - 204
-      when: bmc_detected_type == 'supermicro'
+      when: ipmi_detected_type == 'supermicro'
 
     ###########################################################################
     # HPE AccountService / LDAP CA
@@ -653,7 +704,7 @@
       ansible.builtin.uri:
         url: >-
           https://{{ inventory_hostname }}{{
-            bmc_accountservice_autodetect.json.Oem.Hpe.DirectorySettings.LdapCaCertificates['@odata.id']
+            ipmi_accountservice_autodetect.json.Oem.Hpe.DirectorySettings.LdapCaCertificates['@odata.id']
           }}
         method: POST
         body_format: json
@@ -669,7 +720,7 @@
       register: hpe_ca_import_ilo5
       changed_when: hpe_ca_import_ilo5.status in [200, 201, 202, 204]
       failed_when: hpe_ca_import_ilo5.status not in [200, 201, 202, 204, 409]
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
     ###########################################################################
     # Directory / Generic LDAP / Active Directory
@@ -695,7 +746,7 @@
           - 200
           - 202
           - 204
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -717,7 +768,7 @@
           - 200
           - 202
           - 204
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -738,7 +789,7 @@
           - 200
           - 202
           - 204
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -780,35 +831,15 @@
       changed_when: >
         hpe_directory_ribcl_ilo4.status == 200 and
         ('0x0000' in (hpe_directory_ribcl_ilo4.content | default('')))
-      failed_when: false
+      failed_when: >
+        hpe_directory_ribcl_ilo4.status != 200 or
+        ('0x0000' not in (hpe_directory_ribcl_ilo4.content | default('')))
       retries: 5
       delay: 10
       until: >
         hpe_directory_ribcl_ilo4.status == 200 and
         ('0x0000' in (hpe_directory_ribcl_ilo4.content | default('')))
-      ignore_errors: true
-      when: bmc_detected_type == 'ilo4'
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Fail if Directory RIBCL failed for HPE iLO4
-    # Если предыдущая RIBCL-настройка Directory не вернула STATUS 0x0000, явно падаем с очищенным ответом.
-    # Пароль в выводе маскируется, чтобы можно было понять ошибку без утечки кредов.
-    - name: Fail if Directory RIBCL failed for HPE iLO4
-      ansible.builtin.fail:
-        msg:
-          status_code: "{{ hpe_directory_ribcl_ilo4.status | default('not_run') }}"
-          directory_ok: "{{ ('0x0000' in (hpe_directory_ribcl_ilo4.content | default(''))) if hpe_directory_ribcl_ilo4 is defined else false }}"
-          ribcl_response: >-
-            {{
-              hpe_directory_ribcl_ilo4.content
-              | default('')
-              | regex_replace('PASSWORD=\"[^\"]+\"', 'PASSWORD=\"***\"')
-              | regex_replace("PASSWORD='[^']+'", "PASSWORD='***'")
-            }}
-      when:
-        - bmc_detected_type == 'ilo4'
-        - "'0x0000' not in (hpe_directory_ribcl_ilo4.content | default(''))"
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -839,9 +870,11 @@
       changed_when: >
         hpe_clear_user_context_ilo4.status == 200 and
         ('0x0000' in (hpe_clear_user_context_ilo4.content | default('')))
-      failed_when: false
+      failed_when: >
+        hpe_clear_user_context_ilo4.status != 200 or
+        ('0x0000' not in (hpe_clear_user_context_ilo4.content | default('')))
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -849,9 +882,9 @@
     # Делаем паузу перед импортом CA на iLO4.
     # После Directory/RIBCL изменений старый web backend iLO4 может быть не готов сразу принять /json/directory запрос.
     - name: Wait before HPE iLO4 LDAP CA web import
-      ansible.builtin.pause:
-        seconds: 45
-      when: bmc_detected_type == 'ilo4'
+      ansible.builtin.wait_for:
+        timeout: 45
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -887,7 +920,16 @@
           - 500
       register: hpe_ilo4_web_login
       changed_when: false
-      failed_when: false
+      failed_when: >
+        hpe_ilo4_web_login.status != 200 or
+        not (
+          ((hpe_ilo4_web_login.json | default({})).get('session_key', '') | length > 0)
+          or ((hpe_ilo4_web_login.json | default({})).get('sessionKey', '') | length > 0)
+          or ((hpe_ilo4_web_login.cookies | default({})).get('sessionKey', '') | length > 0)
+          or ((hpe_ilo4_web_login.cookies | default({})).get('session_key', '') | length > 0)
+          or ((hpe_ilo4_web_login.cookies_string | default('') | regex_search('sessionKey=([^;]+)')) is not none)
+          or ((hpe_ilo4_web_login.content | default('') | regex_search('"session_key"\s*:\s*"([^"]+)"')) is not none)
+        )
       retries: 8
       delay: 15
       until: >
@@ -905,7 +947,7 @@
           or
           ((hpe_ilo4_web_login.content | default('') | regex_search('"session_key"\\s*:\\s*"([^"]+)"')) is not none)
         )
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -941,7 +983,7 @@
             )
           }}
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -978,12 +1020,12 @@
           - 500
       register: hpe_ca_import_web_ilo4
       changed_when: hpe_ca_import_web_ilo4.status == 200
-      failed_when: false
+      failed_when: hpe_ca_import_web_ilo4.status != 200
       retries: 5
       delay: 15
       until: hpe_ca_import_web_ilo4.status == 200
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -1016,7 +1058,7 @@
       failed_when: false
       no_log: true
       when:
-        - bmc_detected_type == 'ilo4'
+        - ipmi_detected_type == 'ilo4'
         - hpe_ilo4_web_session_key | default('') | length > 0
 
 
@@ -1051,15 +1093,16 @@
       changed_when: >
         hpe_generic_ldap_ribcl_ilo4.status == 200 and
         ('0x0000' in (hpe_generic_ldap_ribcl_ilo4.content | default('')))
-      failed_when: false
+      failed_when: >
+        hpe_generic_ldap_ribcl_ilo4.status != 200 or
+        ('0x0000' not in (hpe_generic_ldap_ribcl_ilo4.content | default('')))
       retries: 5
       delay: 10
       until: >
         hpe_generic_ldap_ribcl_ilo4.status == 200 and
         ('0x0000' in (hpe_generic_ldap_ribcl_ilo4.content | default('')))
-      ignore_errors: true
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -1088,9 +1131,11 @@
           - 500
       register: hpe_dir_config_verify_ilo4
       changed_when: false
-      failed_when: false
+      failed_when: >
+        hpe_dir_config_verify_ilo4.status != 200 or
+        ('0x0000' not in (hpe_dir_config_verify_ilo4.content | default('')))
       no_log: true
-      when: bmc_detected_type == 'ilo4'
+      when: ipmi_detected_type == 'ilo4'
 
 
     # ----------------------------------------------------------------------
@@ -1101,7 +1146,7 @@
       ansible.builtin.fail:
         msg: "Generic LDAP was not enabled on {{ inventory_hostname }} after RIBCL apply. Check iLO Directory settings manually."
       when:
-        - bmc_detected_type == 'ilo4'
+        - ipmi_detected_type == 'ilo4'
         - (hpe_dir_config_verify_ilo4.content | default('') | regex_search('DIR_GENERIC_LDAP_ENABLED[^>]+VALUE="(Yes|Y)"')) is none
     
 
@@ -1127,7 +1172,7 @@
           - 200
           - 204
           - 302
-      when: bmc_detected_type == 'supermicro'
+      when: ipmi_detected_type == 'supermicro'
 
 
     # ----------------------------------------------------------------------
@@ -1141,7 +1186,7 @@
         return_content: true
         status_code: 200
       register: smc_ad_rolegroups
-      when: bmc_detected_type == 'supermicro'
+      when: ipmi_detected_type == 'supermicro'
 
 
     # ----------------------------------------------------------------------
@@ -1162,7 +1207,7 @@
           - 201
           - 204
       when:
-        - bmc_detected_type == 'supermicro'
+        - ipmi_detected_type == 'supermicro'
         - smc_ad_rolegroups.json['Members@odata.count'] | int == 0
 
 
@@ -1184,7 +1229,7 @@
           - 204
           - 302
       when:
-        - bmc_detected_type == 'supermicro'
+        - ipmi_detected_type == 'supermicro'
         - smc_ad_rolegroups.json['Members@odata.count'] | int > 0
 
     ###########################################################################
@@ -1200,7 +1245,7 @@
       ansible.builtin.uri:
         url: >-
           https://{{ inventory_hostname }}{{
-            bmc_manager_autodetect.json['@odata.id'] | regex_replace('/$', '')
+            ipmi_manager_autodetect.json['@odata.id'] | regex_replace('/$', '')
           }}/Actions/Manager.Reset/
         method: POST
         body_format: json
@@ -1210,9 +1255,8 @@
           - 200
           - 202
           - 204
-      failed_when: false
       changed_when: true
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -1226,7 +1270,23 @@
         delay: 25
         timeout: 180
         state: started
-      when: bmc_detected_type == 'ilo5'
+      when: ipmi_detected_type == 'ilo5'
+
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify HPE iLO5 Redfish after reset
+    # Проверяем не только открытый TCP 443, но и готовность Redfish API.
+    - name: Verify HPE iLO5 Redfish after reset
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/redfish/v1/"
+        method: GET
+        status_code: 200
+      register: hpe_ilo5_redfish_ready
+      retries: 12
+      delay: 10
+      until: hpe_ilo5_redfish_ready.status == 200
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
 
 
     # ----------------------------------------------------------------------
@@ -1249,7 +1309,6 @@
               </RIB_INFO>
             </LOGIN>
           </RIBCL>
-        return_content: true
         status_code:
           - 200
           - 500
@@ -1257,7 +1316,7 @@
       changed_when: true
       no_log: true
       when:
-        - bmc_detected_type == 'ilo4'
+        - ipmi_detected_type == 'ilo4'
         - hpe_ilo4_reset_after_ribcl | bool
 
 
@@ -1273,5 +1332,23 @@
         timeout: 180
         state: started
       when:
-        - bmc_detected_type == 'ilo4'
+        - ipmi_detected_type == 'ilo4'
+        - hpe_ilo4_reset_after_ribcl | bool
+
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify HPE iLO4 Redfish after reset
+    # После финального reset проверяем, что Redfish API реально отвечает HTTP 200.
+    - name: Verify HPE iLO4 Redfish after reset
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}/redfish/v1/"
+        method: GET
+        status_code: 200
+      register: hpe_ilo4_redfish_ready
+      retries: 18
+      delay: 10
+      until: hpe_ilo4_redfish_ready.status == 200
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo4'
         - hpe_ilo4_reset_after_ribcl | bool
