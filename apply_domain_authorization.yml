@@ -5,11 +5,10 @@
 # Inventory может содержать только IP-адреса. Креды берутся из vault.yml:
 # ipmi_default_login / ipmi_default_pass.
 # Общие настройки DNS/NTP/LDAP/CA/группы заданы напрямую в разделе vars этого playbook.
-#
-# Комментарии перед каждой задачей описывают, зачем нужен шаг и что он меняет.
+
 ---
 - name: Apply IPMI DNS, NTP and Directory settings
-  hosts: ipmi_test
+  hosts: ipmi_fullaccess
   gather_facts: false
   connection: local
   strategy: free
@@ -26,9 +25,10 @@
     ipmi_dns_primary: "192.168.10.10"
     ipmi_dns_secondary: "192.168.10.20"
 
-    # Общие NTP/SNTP-серверы.
-    ipmi_ntp_primary: "nls.local"
-    ipmi_ntp_secondary: "nls.local"
+    # Общие NTP/SNTP-серверы. Используем два отдельных IP-адреса,
+    # чтобы Primary и Secondary были независимыми источниками времени.
+    ipmi_ntp_primary: "192.168.10.10"
+    ipmi_ntp_secondary: "192.168.10.20"
 
     # Часовые пояса. iLO5 использует числовой индекс, iLO4 — имя зоны.
     ipmi_ilo5_timezone_index: 22
@@ -37,33 +37,103 @@
     # Часовой пояс Supermicro. Redfish принимает смещение в формате +HH:MM; +05:00 соответствует UTC+05:00.
     ipmi_supermicro_timezone: "+05:00"
 
-    # Режим сетевого стека Supermicro: только IPv4, весь IPv6 отключён.
-    ipmi_supermicro_ip_protocol: "IPv4"
-
-    # Параметры LDAP/LDAPS и доменной группы.
+    # Общие параметры LDAP/LDAPS.
     ipmi_directory_server: "nls.local"
+    ipmi_directory_domain: "nls.local"
     ipmi_directory_ldap_port: 636
-    ipmi_directory_ca_certificate: "files/CA.nls.local.crt"
-    ipmi_directory_group_name: "ipmi_oor"
-    ipmi_directory_group_dn: "CN=ipmi_fullaccess,OU=IPMI,OU=sec_groups,DC=nls,DC=local"
-    ipmi_directory_group_sid: "S-1-5-21-3327389993-1476621842-507159828-7674"
+    ipmi_directory_ca_certificate: "/etc/ansible/playbooks/domain_authorization/files/CA.nls.local.crt"
 
-    # Права группы: для iLO4 используется список 1-6, для iLO5/Supermicro — Administrator.
-    ipmi_ilo4_directory_privileges: "1,2,3,4,5,6"
-    ipmi_directory_role: "Administrator"
+    # Inventory-группы ниже являются единственным источником истины
+    # для доменных групп на каждом BMC. Порядок фиксированный:
+    # на iLO4 он определяет номера DIR_GRPACCT1..6.
+    ipmi_managed_directory_inventory_groups:
+      - ipmi_fullaccess
+      - ipmi_pd
+      - ipmi_ot
+      - ipmi_devs
+
+    # Каталог управляемых AD-групп.
+    # iLO4 получает точный набор отдельных прав.
+    # iLO5 создаёт dirgroup* из Administrator/Operator, затем получает точные права.
+    # Supermicro использует уровни Network Privilege Administrator/Operator.
+    ipmi_directory_groups:
+      ipmi_fullaccess:
+        name: "ipmi_fullaccess"
+        dn: "CN=ipmi_fullaccess,OU=IPMI,OU=sec_groups,DC=nls,DC=local"
+        sid: "S-1-5-21-3327389993-1476621842-507159828-7674"
+        ilo4_privileges: "1,2,3,4,5,6"
+        privilege_profile: "full"
+        ilo5_seed_role: "Administrator"
+        supermicro_privilege: "Administrator"
+
+      ipmi_pd:
+        name: "ipmi_pd"
+        dn: "CN=ipmi_pd,OU=IPMI,OU=sec_groups,DC=nls,DC=local"
+        sid: "S-1-5-21-3327389993-1476621842-507159828-5909"
+        ilo4_privileges: "2,3,4,6"
+        privilege_profile: "limited"
+        ilo5_seed_role: "Operator"
+        supermicro_privilege: "Operator"
+
+      ipmi_ot:
+        name: "ipmi_ot"
+        dn: "CN=ipmi_ot,OU=IPMI,OU=sec_groups,DC=nls,DC=local"
+        sid: "S-1-5-21-3327389993-1476621842-507159828-5908"
+        ilo4_privileges: "2,3,4,6"
+        privilege_profile: "limited"
+        ilo5_seed_role: "Operator"
+        supermicro_privilege: "Operator"
+
+      ipmi_devs:
+        name: "ipmi_devs"
+        dn: "CN=ipmi_devs,OU=IPMI,OU=sec_groups,DC=nls,DC=local"
+        sid: "S-1-5-21-3327389993-1476621842-507159828-7675"
+        ilo4_privileges: "2,3,4,6"
+        privilege_profile: "limited"
+        ilo5_seed_role: "Operator"
+        supermicro_privilege: "Operator"
+
+    # Любая доменная группа, отсутствующая в рассчитанном списке для хоста,
+    # удаляется. Поэтому Authenticated Users / S-1-5-11 также удаляется
+    # на iLO4, iLO5 и Supermicro.
+    ipmi_forbidden_directory_group_name: "Authenticated Users"
+    ipmi_forbidden_directory_group_sid: "S-1-5-11"
+
+    # Точный полный набор стандартных прав iLO5 для ipmi_fullaccess.
+    # ConfigureComponents не добавляем: тестовый iLO5 не сохраняет эту
+    # привилегию для Directory Group и возвращает её без данного значения.
+    ipmi_ilo5_full_assigned_privileges:
+      - "Login"
+      - "ConfigureManager"
+      - "ConfigureUsers"
+      - "ConfigureSelf"
+
+    # Точный ограниченный набор прав iLO5 для ipmi_pd/ipmi_ot/ipmi_devs.
+    # Использование одной только встроенной роли Operator недостаточно:
+    # она может дополнительно включать Host BIOS/NIC/Storage privileges.
+    ipmi_ilo5_limited_assigned_privileges:
+      - "Login"
+    ipmi_ilo5_limited_oem_privileges:
+      - "RemoteConsolePriv"
+      - "VirtualPowerAndResetPriv"
+      - "VirtualMediaPriv"
 
     # После сетевых и Directory-изменений iLO4 перезапускается.
     hpe_ilo4_reset_after_ribcl: true
 
+  # Общие параметры всех HTTP-запросов к BMC.
+  # Сертификаты IPMI обычно самоподписанные, поэтому их проверка отключена.
+  # Basic Auth включён по умолчанию; отдельные HTTP/web-session задачи явно
+  # переопределяют учётные данные, чтобы не отправлять пароль без необходимости.
   module_defaults:
     ansible.builtin.uri:
       validate_certs: false
       url_username: "{{ ipmi_login }}"
       url_password: "{{ ipmi_password }}"
       force_basic_auth: true
-      headers:
-        Accept: "application/json"
-        Content-Type: "application/json"
+
+  # status_code указывается только в задачах, где допустимы ответы кроме 200:
+  # например 202/204 для Redfish write, 201 при создании и 404 для optional endpoint.
 
   tasks:
     ###########################################################################
@@ -93,7 +163,7 @@
     # Обращаемся к IPMI по обычному HTTP без авторизации и не переходим по редиректу.
     # Хосты с нестандартным HTTPS-портом возвращают полный адрес в заголовке Location.
     # Хосты без редиректа обычно возвращают HTTP 200.
-    # Ошибку этой задачи временно сохраняем в redirect_info, чтобы следующая задача
+    # Ошибку этой задаче временно сохраняем в redirect_info, чтобы следующая задача
     # могла вывести короткое понятное сообщение и пометить текущий хост как FAILED.
     - name: Get redirect location
       ansible.builtin.uri:
@@ -101,17 +171,12 @@
         method: GET
         url_username: ""
         url_password: ""
+        # Не отправляем Basic Auth по незашифрованному HTTP.
         force_basic_auth: false
+        # Не переходим по редиректу: нам нужен исходный заголовок Location.
         follow_redirects: none
-        return_content: false
+        # Ограничиваем ожидание недоступного BMC, чтобы не задерживать остальные хосты.
         timeout: 5
-        status_code:
-          - 200
-          - 301
-          - 302
-          - 303
-          - 307
-          - 308
       register: redirect_info
       changed_when: false
       failed_when: false
@@ -152,9 +217,7 @@
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/Managers"
         method: GET
-        return_content: true
         timeout: 10
-        status_code: 200
       register: ipmi_managers_autodetect
       changed_when: false
       no_log: true
@@ -171,8 +234,6 @@
             ipmi_managers_autodetect.json.Members[0]['@odata.id']
           }}
         method: GET
-        return_content: true
-        status_code: 200
       register: ipmi_manager_autodetect
       changed_when: false
       no_log: true
@@ -186,7 +247,6 @@
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/AccountService/"
         method: GET
-        return_content: true
         status_code:
           - 200
           - 404
@@ -215,9 +275,9 @@
           ) -%}
           {%- if ('supermicro' in text) or ('smcmanagerextensions' in text) or ('supermicro' in oem) -%}
           supermicro
-          {%- elif ('ilo 5' in text) or ('ilo5' in text) or (('directorysettings' in text) and ('hpe' in oem or '"hpe"' in text)) -%}
+          {%- elif ('ilo 5' in text) or ('ilo5' in text) -%}
           ilo5
-          {%- elif ('ilo 4' in text) or ('ilo4' in text) or ('hpiloaccountservice' in text) or ('hpilomanager' in text) or ('hp' in oem) or ('hpe' in oem) -%}
+          {%- elif ('ilo 4' in text) or ('ilo4' in text) -%}
           ilo4
           {%- else -%}
           unsupported
@@ -235,6 +295,123 @@
           HPE iLO4, HPE iLO5 или Supermicro.
       when: ipmi_detected_type == 'unsupported'
 
+    # ----------------------------------------------------------------------
+    # Задача: Initialize desired directory groups
+    # Начинаем с пустого списка и дальше добавляем только те AD-группы,
+    # в одноимённых inventory-группах которых состоит текущий IPMI-хост.
+    - name: Initialize desired directory groups
+      ansible.builtin.set_fact:
+        ipmi_desired_directory_groups: []
+      changed_when: false
+
+    # ----------------------------------------------------------------------
+    # Задача: Build desired directory groups from inventory membership
+    # Один IP может состоять сразу в нескольких inventory-группах.
+    # Например ipmi_fullaccess + ipmi_devs даст две доменные группы на BMC.
+    - name: Build desired directory groups from inventory membership
+      ansible.builtin.set_fact:
+        ipmi_desired_directory_groups: >-
+          {{
+            ipmi_desired_directory_groups
+            +
+            [
+              ipmi_directory_groups[item]
+              | combine({'inventory_group': item})
+            ]
+          }}
+      loop: "{{ ipmi_managed_directory_inventory_groups }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      when: item in group_names
+
+    # ----------------------------------------------------------------------
+    # Задача: Validate desired directory group set
+    # Все управляемые хосты должны иметь ipmi_fullaccess.
+    # iLO4 поддерживает максимум шесть Directory Group Account slots.
+    - name: Validate desired directory group set
+      ansible.builtin.assert:
+        that:
+          - "'ipmi_fullaccess' in group_names"
+          - ipmi_desired_directory_groups | length > 0
+          - ipmi_detected_type != 'ilo4' or ipmi_desired_directory_groups | length <= 6
+          - >-
+            (
+              ipmi_desired_directory_groups
+              | selectattr('name', 'equalto', ipmi_forbidden_directory_group_name)
+              | list
+              | length
+            ) == 0
+          - >-
+            (
+              ipmi_desired_directory_groups
+              | selectattr('sid', 'equalto', ipmi_forbidden_directory_group_sid)
+              | list
+              | length
+            ) == 0
+        fail_msg: >-
+          Некорректное членство inventory-групп для {{ inventory_hostname }}.
+          Хост обязан входить в ipmi_fullaccess; для iLO4 допускается не более
+          шести управляемых доменных групп.
+        quiet: true
+
+    # ----------------------------------------------------------------------
+    # Задача: Build vendor-specific desired directory group lists
+    # Преобразуем единый каталог в форматы iLO4, iLO5 и Supermicro.
+    - name: Initialize vendor-specific desired directory group lists
+      ansible.builtin.set_fact:
+        ipmi_desired_ilo4_groups: []
+        ipmi_desired_ilo5_mappings: []
+        ipmi_desired_supermicro_role_groups: []
+      changed_when: false
+
+    - name: Build vendor-specific desired directory group lists
+      ansible.builtin.set_fact:
+        ipmi_desired_ilo4_groups: >-
+          {{
+            ipmi_desired_ilo4_groups
+            +
+            [
+              {
+                'name': item.dn,
+                'privileges': item.ilo4_privileges,
+                'sid': item.sid
+              }
+            ]
+          }}
+        ipmi_desired_ilo5_mappings: >-
+          {{
+            ipmi_desired_ilo5_mappings
+            +
+            [
+              {
+                'name': item.name,
+                'dn': item.dn,
+                'sid': item.sid,
+                'key': (item.dn | lower) ~ ':' ~ (item.sid | upper),
+                'profile': item.privilege_profile,
+                'SeedRole': item.ilo5_seed_role,
+                'RemoteGroup': item.dn ~ ':' ~ item.sid
+              }
+            ]
+          }}
+        ipmi_desired_supermicro_role_groups: >-
+          {{
+            ipmi_desired_supermicro_role_groups
+            +
+            [
+              {
+                'name': item.name,
+                'domain': ipmi_directory_domain,
+                'privilege': item.supermicro_privilege
+              }
+            ]
+          }}
+      loop: "{{ ipmi_desired_directory_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
     ###########################################################################
     # HPE discovery
     ###########################################################################
@@ -251,8 +428,6 @@
             ipmi_manager_autodetect.json.EthernetInterfaces['@odata.id']
           }}
         method: GET
-        return_content: true
-        status_code: 200
       register: hpe_eth_collection
       changed_when: false
       when: ipmi_detected_type in ['ilo4', 'ilo5']
@@ -269,8 +444,6 @@
             hpe_eth_collection.json.Members[0]['@odata.id']
           }}
         method: GET
-        return_content: true
-        status_code: 200
       register: hpe_eth_current
       changed_when: false
       when: ipmi_detected_type in ['ilo4', 'ilo5']
@@ -290,6 +463,955 @@
           }}
       when: ipmi_detected_type in ['ilo4', 'ilo5']
 
+
+    ###########################################################################
+    # Current state and drift detection
+    ###########################################################################
+
+    # ----------------------------------------------------------------------
+    # Задача: Read local LDAP CA certificate metadata
+    # Читаем только серийный номер локального CA через openssl.
+    # Команда является read-only, поэтому changed_when принудительно установлен в false.
+    - name: Read local LDAP CA certificate metadata
+      ansible.builtin.command:
+        argv:
+          - openssl
+          - x509
+          - -in
+          - "{{ ipmi_directory_ca_certificate }}"
+          - -noout
+          - -serial
+      register: local_ldap_ca_metadata
+      changed_when: false
+      when: ipmi_detected_type in ['ilo4', 'ilo5']
+
+    # ----------------------------------------------------------------------
+    # Задача: Set local LDAP CA comparison values
+    # Нормализуем серийный номер локального CA: удаляем двоеточия и приводим к верхнему регистру.
+    # Так значение можно напрямую сравнивать с SerialNumber, возвращаемым Redfish.
+
+    - name: Set local LDAP CA comparison values
+      ansible.builtin.set_fact:
+        local_ldap_ca_serial: >-
+          {{
+            local_ldap_ca_metadata.stdout
+            | regex_findall('(?im)^serial=([0-9a-f:]+)$')
+            | first
+            | default('')
+            | regex_replace(':', '')
+            | upper
+          }}
+      when: ipmi_detected_type in ['ilo4', 'ilo5']
+
+    # ----------------------------------------------------------------------
+    # Задача: Select HPE iLO4 LDAP CA Redfish data
+    # Ищем URI коллекции LDAP CA и резервный флаг загрузки сертификата в OEM-разделах Hp/Hpe.
+
+    - name: Select HPE iLO4 LDAP CA Redfish data
+      ansible.builtin.set_fact:
+        ilo4_ldap_ca_collection_uri: >-
+          {{
+            (
+              ipmi_accountservice_autodetect.json
+              | default({})
+            ).get('Oem', {}).get('Hp', {}).get(
+              'DirectorySettings', {}
+            ).get('LdapCaCertificates', {}).get('@odata.id', '')
+            or
+            (
+              ipmi_accountservice_autodetect.json
+              | default({})
+            ).get('Oem', {}).get('Hpe', {}).get(
+              'DirectorySettings', {}
+            ).get('LdapCaCertificates', {}).get('@odata.id', '')
+          }}
+        ilo4_ca_loaded_accountservice: >-
+          {%- set hp = (
+            ipmi_accountservice_autodetect.json
+            | default({})
+          ).get('Oem', {}).get('Hp', {}).get('DirectorySettings', {}) -%}
+          {%- set hpe = (
+            ipmi_accountservice_autodetect.json
+            | default({})
+          ).get('Oem', {}).get('Hpe', {}).get('DirectorySettings', {}) -%}
+          {%- if hp.get('LdapCaCertificateLoaded') is not none -%}
+          {{ hp.get('LdapCaCertificateLoaded') | bool | lower }}
+          {%- elif hpe.get('LdapCaCertificateLoaded') is not none -%}
+          {{ hpe.get('LdapCaCertificateLoaded') | bool | lower }}
+          {%- else -%}
+          unknown
+          {%- endif -%}
+      changed_when: false
+      when: ipmi_detected_type == 'ilo4'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read HPE iLO4 LDAP CA certificate collection
+    # Читаем коллекцию LDAP CA, если firmware iLO4 опубликовала её URI.
+    # HTTP 404 допустим: старые версии firmware могут не поддерживать эту коллекцию.
+
+    - name: Read HPE iLO4 LDAP CA certificate collection
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ ilo4_ldap_ca_collection_uri }}"
+        method: GET
+        status_code:
+          - 200
+          - 404
+      register: ilo4_ldap_ca_collection
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_ldap_ca_collection_uri | length > 0
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current HPE iLO4 LDAP CA certificate
+    # Если коллекция непустая, читаем первый установленный LDAP CA и получаем его SerialNumber.
+
+    - name: Read current HPE iLO4 LDAP CA certificate
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ ilo4_ldap_ca_collection.json.Members[0]['@odata.id'] }}"
+        method: GET
+      register: ilo4_ldap_ca_current
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_ldap_ca_collection.status | default(0) | int == 200
+        - ilo4_ldap_ca_collection.json.get('Members@odata.count', 0) | int > 0
+
+    # ----------------------------------------------------------------------
+    # Задача: Read HPE iLO4 ServiceRoot for LDAP CA fallback
+    # Для старых firmware читаем ServiceRoot как последний резервный источник состояния LDAP CA.
+
+    - name: Read HPE iLO4 ServiceRoot for LDAP CA fallback
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/redfish/v1/"
+        method: GET
+      register: ilo4_service_root
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_ldap_ca_collection_uri | length == 0
+        - ilo4_ca_loaded_accountservice == 'unknown'
+
+    # ----------------------------------------------------------------------
+    # Задача: Calculate HPE iLO4 LDAP CA drift
+    # Определяем, известен ли статус CA и отличается ли установленный сертификат от локального.
+    # Приоритет проверки: SerialNumber, коллекция, флаг LdapCaCertificateLoaded, затем fallback.
+
+    - name: Calculate HPE iLO4 LDAP CA drift
+      ansible.builtin.set_fact:
+        ilo4_ca_status_known: >-
+          {%- set serial = (
+            ilo4_ldap_ca_current.json.get('SerialNumber', '')
+            if ilo4_ldap_ca_current.json is defined
+            else ''
+          ) | regex_replace(':', '') | upper -%}
+          {%- set collection_known = (
+            ilo4_ldap_ca_collection.status | default(0) | int == 200
+          ) -%}
+          {%- set account_known = (
+            ilo4_ca_loaded_accountservice | default('unknown')
+          ) in ['true', 'false'] -%}
+          {%- set root_value = (
+            ilo4_service_root.json
+            | default({})
+          ).get('Oem', {}).get('Hp', {}).get(
+            'Sessions', {}
+          ).get('LDAPAuthLicenced', none) -%}
+          {{
+            (serial | length > 0)
+            or collection_known
+            or account_known
+            or (root_value is not none)
+          }}
+        ilo4_ca_drift: >-
+          {%- set serial = (
+            ilo4_ldap_ca_current.json.get('SerialNumber', '')
+            if ilo4_ldap_ca_current.json is defined
+            else ''
+          ) | regex_replace(':', '') | upper -%}
+          {%- set collection_status = (
+            ilo4_ldap_ca_collection.status | default(0) | int
+          ) -%}
+          {%- set collection_count = (
+            ilo4_ldap_ca_collection.json.get('Members@odata.count', 0)
+            if ilo4_ldap_ca_collection.json is defined
+            else 0
+          ) | int -%}
+          {%- set account_value = (
+            ilo4_ca_loaded_accountservice | default('unknown')
+          ) -%}
+          {%- set root_value = (
+            ilo4_service_root.json
+            | default({})
+          ).get('Oem', {}).get('Hp', {}).get(
+            'Sessions', {}
+          ).get('LDAPAuthLicenced', none) -%}
+          {%- if serial | length > 0 -%}
+          {{ serial != local_ldap_ca_serial }}
+          {%- elif collection_status == 200 -%}
+          {{ collection_count == 0 }}
+          {%- elif account_value in ['true', 'false'] -%}
+          {{ account_value != 'true' }}
+          {%- elif root_value is not none -%}
+          {{ not (root_value | bool) }}
+          {%- else -%}
+          false
+          {%- endif -%}
+        ilo4_ca_comparison_mode: >-
+          {%- set serial = (
+            ilo4_ldap_ca_current.json.get('SerialNumber', '')
+            if ilo4_ldap_ca_current.json is defined
+            else ''
+          ) | regex_replace(':', '') | upper -%}
+          {%- if serial | length > 0 -%}
+          serial
+          {%- elif (
+            ilo4_ldap_ca_collection.status | default(0) | int
+          ) == 200 -%}
+          collection
+          {%- elif (
+            ilo4_ca_loaded_accountservice | default('unknown')
+          ) in ['true', 'false'] -%}
+          loaded_flag
+          {%- elif (
+            ilo4_service_root.json
+            | default({})
+          ).get('Oem', {}).get('Hp', {}).get(
+            'Sessions', {}
+          ).get('LDAPAuthLicenced', none) is not none -%}
+          service_root_flag
+          {%- else -%}
+          unknown
+          {%- endif -%}
+      changed_when: false
+      when: ipmi_detected_type == 'ilo4'
+
+    # ----------------------------------------------------------------------
+    # Задача: Fail when HPE iLO4 LDAP CA state cannot be determined
+    # Останавливаем текущий хост, если состояние LDAP CA нельзя достоверно определить.
+    # Продолжение могло бы привести к ложной идемпотентности или лишнему импорту.
+
+    - name: Fail when HPE iLO4 LDAP CA state cannot be determined
+      ansible.builtin.fail:
+        msg: >-
+          Не удалось определить состояние LDAP CA на HPE iLO4
+          {{ inventory_hostname }} через поддерживаемые Redfish-поля.
+          Firmware может быть старее версии с поддержкой LDAP CA status.
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - not (ilo4_ca_status_known | bool)
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current HPE network settings via RIBCL
+    # Читаем сеть через RIBCL, потому что часть DNS/IPv6/SNTP-полей отсутствует в Redfish.
+
+    - name: Read current HPE network settings via RIBCL
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/ribcl"
+        method: POST
+        headers:
+          Accept: "*/*"
+          Content-Type: "text/xml"
+        body_format: raw
+        body: |
+          <RIBCL VERSION="2.0">
+            <LOGIN USER_LOGIN="{{ ipmi_login | e }}" PASSWORD="{{ ipmi_password | e }}">
+              <RIB_INFO MODE="read">
+                <GET_NETWORK_SETTINGS/>
+              </RIB_INFO>
+            </LOGIN>
+          </RIBCL>
+        return_content: true
+      register: hpe_network_current_ribcl
+      changed_when: false
+      failed_when: >
+        hpe_network_current_ribcl.status != 200 or
+        ('0x0000' not in (hpe_network_current_ribcl.content | default('')))
+      no_log: true
+      when: ipmi_detected_type in ['ilo4', 'ilo5']
+
+    # ----------------------------------------------------------------------
+    # Задача: Parse current HPE network settings
+    # Извлекаем из XML RIBCL текущие DNS, IPv6, DHCP SNTP, NTP и часовой пояс.
+    # Нормализованные значения дальше используются только для расчёта drift.
+
+    - name: Parse current HPE network settings
+      ansible.builtin.set_fact:
+        hpe_network_state:
+          dhcp_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCP_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          prim_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<PRIM_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          sec_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<SEC_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ter_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<TER_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcp_wins_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCP_WINS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          reg_wins_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<REG_WINS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          prim_wins_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<PRIM_WINS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          sec_wins_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<SEC_WINS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          reg_ddns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<REG_DDNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ipv6_preferred_protocol: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<IPV6_PREFERRED_PROTOCOL[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ipv6_addr_autocfg: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<IPV6_ADDR_AUTOCFG[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ipv6_reg_ddns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<IPV6_REG_DDNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcpv6_stateless_enable: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCPV6_STATELESS_ENABLE[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcpv6_stateful_enable: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCPV6_STATEFUL_ENABLE[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcpv6_rapid_commit: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCPV6_RAPID_COMMIT[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcpv6_domain_name: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCPV6_DOMAIN_NAME[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcpv6_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCPV6_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcpv6_sntp_settings: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCPV6_SNTP_SETTINGS[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ipv6_prim_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<IPV6_PRIM_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ipv6_sec_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<IPV6_SEC_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ipv6_ter_dns_server: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<IPV6_TER_DNS_SERVER[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          ipv6_default_gateway: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<IPV6_DEFAULT_GATEWAY[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          dhcp_sntp_settings: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<DHCP_SNTP_SETTINGS[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          sntp_server1: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<SNTP_SERVER1[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          sntp_server2: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<SNTP_SERVER2[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          timezone: >-
+            {{ (hpe_network_current_ribcl.content | regex_findall('(?i)<TIMEZONE[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+      no_log: true
+      when: ipmi_detected_type in ['ilo4', 'ilo5']
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current HPE iLO4 Directory settings via RIBCL
+    # Читаем Directory и Generic LDAP через RIBCL для последующего точного сравнения.
+
+    - name: Read current HPE iLO4 Directory settings via RIBCL
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/ribcl"
+        method: POST
+        headers:
+          Accept: "*/*"
+          Content-Type: "text/xml"
+        body_format: raw
+        body: |
+          <RIBCL VERSION="2.0">
+            <LOGIN USER_LOGIN="{{ ipmi_login | e }}" PASSWORD="{{ ipmi_password | e }}">
+              <DIR_INFO MODE="read">
+                <GET_DIR_CONFIG/>
+              </DIR_INFO>
+            </LOGIN>
+          </RIBCL>
+        return_content: true
+      register: hpe_directory_current_ribcl_ilo4
+      changed_when: false
+      failed_when: >
+        hpe_directory_current_ribcl_ilo4.status != 200 or
+        ('0x0000' not in (hpe_directory_current_ribcl_ilo4.content | default('')))
+      no_log: true
+      when: ipmi_detected_type == 'ilo4'
+
+    # ----------------------------------------------------------------------
+    # Задача: Parse current HPE iLO4 Directory settings
+    # Извлекаем общие параметры Directory и Generic LDAP.
+    - name: Parse current HPE iLO4 Directory settings
+      ansible.builtin.set_fact:
+        ilo4_directory_state:
+          authentication_enabled: >-
+            {{ (hpe_directory_current_ribcl_ilo4.content | regex_findall('(?i)<DIR_AUTHENTICATION_ENABLED[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          local_user_acct: >-
+            {{ (hpe_directory_current_ribcl_ilo4.content | regex_findall('(?i)<DIR_LOCAL_USER_ACCT[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          generic_ldap_enabled: >-
+            {{ (hpe_directory_current_ribcl_ilo4.content | regex_findall('(?i)<DIR_GENERIC_LDAP_ENABLED[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          server_address: >-
+            {{ (hpe_directory_current_ribcl_ilo4.content | regex_findall('(?i)<DIR_SERVER_ADDRESS[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          server_port: >-
+            {{ (hpe_directory_current_ribcl_ilo4.content | regex_findall('(?i)<DIR_SERVER_PORT[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          user_context_1: >-
+            {{ (hpe_directory_current_ribcl_ilo4.content | regex_findall('(?i)<DIR_USER_CONTEXT_1[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+          group_enabled: >-
+            {{ (hpe_directory_current_ribcl_ilo4.content | regex_findall('(?i)<DIR_ENABLE_GRP_ACCT[^>]*VALUE *= *"([^"]*)"') | first | default('')) }}
+      no_log: true
+      when: ipmi_detected_type == 'ilo4'
+
+    # ----------------------------------------------------------------------
+    # Задача: Build current HPE iLO4 Directory Group Account list
+    # Читаем все шесть слотов DIR_GRPACCT. Пустые слоты не включаем.
+    - name: Initialize current HPE iLO4 directory groups
+      ansible.builtin.set_fact:
+        ilo4_current_directory_groups: []
+      changed_when: false
+      when: ipmi_detected_type == 'ilo4'
+
+    - name: Build current HPE iLO4 directory groups
+      ansible.builtin.set_fact:
+        ilo4_current_directory_groups: >-
+          {%- set slot = item | string -%}
+          {%- set name_pattern = '(?i)<DIR_GRPACCT' ~ slot ~ '_NAME[^>]*VALUE *= *"([^"]*)"' -%}
+          {%- set privilege_pattern = '(?i)<DIR_GRPACCT' ~ slot ~ '_PRIV[^>]*VALUE *= *"([^"]*)"' -%}
+          {%- set sid_pattern = '(?i)<DIR_GRPACCT' ~ slot ~ '_SID[^>]*VALUE *= *"([^"]*)"' -%}
+          {%- set group_name = (
+            hpe_directory_current_ribcl_ilo4.content
+            | regex_findall(name_pattern)
+            | first
+            | default('')
+          ) -%}
+          {%- set group_privileges = (
+            hpe_directory_current_ribcl_ilo4.content
+            | regex_findall(privilege_pattern)
+            | first
+            | default('')
+            | regex_replace('\\s+', '')
+          ) -%}
+          {%- set group_sid = (
+            hpe_directory_current_ribcl_ilo4.content
+            | regex_findall(sid_pattern)
+            | first
+            | default('')
+          ) -%}
+          {{
+            ilo4_current_directory_groups
+            +
+            (
+              [
+                {
+                  'name': group_name,
+                  'privileges': group_privileges,
+                  'sid': group_sid
+                }
+              ]
+              if (group_name | length > 0 or group_sid | length > 0)
+              else []
+            )
+          }}
+      loop: "{{ range(1, 7) | list }}"
+      loop_control:
+        label: "DIR_GRPACCT{{ item }}"
+      changed_when: false
+      no_log: true
+      when: ipmi_detected_type == 'ilo4'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current HPE iLO5 DateTime settings
+    # Читаем NTP-серверы и индекс часового пояса iLO5.
+
+    - name: Read current HPE iLO5 DateTime settings
+      ansible.builtin.uri:
+        url: >-
+          {{ baseuri }}{{
+            ipmi_manager_autodetect.json['@odata.id'] | regex_replace('/$', '')
+          }}/DateTime
+        method: GET
+      register: ilo5_datetime_current
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read HPE iLO5 LDAP CA certificate collection
+    # Читаем коллекцию LDAP CA iLO5, чтобы определить наличие установленного сертификата.
+
+    - name: Read HPE iLO5 LDAP CA certificate collection
+      ansible.builtin.uri:
+        url: >-
+          {{ baseuri }}{{
+            ipmi_accountservice_autodetect.json.Oem.Hpe.DirectorySettings.LdapCaCertificates['@odata.id']
+          }}
+        method: GET
+      register: ilo5_ldap_ca_collection
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current HPE iLO5 LDAP CA certificate
+    # Читаем установленный LDAP CA iLO5 и сравниваем его SerialNumber с локальным CA.
+
+    - name: Read current HPE iLO5 LDAP CA certificate
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ ilo5_ldap_ca_collection.json.Members[0]['@odata.id'] }}"
+        method: GET
+      register: ilo5_ldap_ca_current
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ldap_ca_collection.json.get('Members@odata.count', 0) | int > 0
+
+    # ----------------------------------------------------------------------
+    # Задача: Read HPE iLO5 Administrator role
+    # Полный набор прав берём из встроенной роли Administrator самого iLO5,
+    # чтобы учитывать дополнительные права конкретной версии firmware.
+    - name: Read HPE iLO5 Administrator role
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/redfish/v1/AccountService/Roles/Administrator/"
+        method: GET
+      register: ilo5_administrator_role
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    # ----------------------------------------------------------------------
+    # Задача: Normalize current HPE iLO5 LDAP group mappings
+    # После создания iLO заменяет Administrator/Operator на внутренний
+    # идентификатор dirgroup*. RemoteGroup может возвращаться как DN или DN:SID,
+    # поэтому окончательные DN и SID читаем из ресурса Roles/dirgroup*.
+    - name: Initialize current HPE iLO5 LDAP mappings
+      ansible.builtin.set_fact:
+        ilo5_current_ldap_mappings: []
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Build current HPE iLO5 LDAP mappings
+      ansible.builtin.set_fact:
+        ilo5_current_ldap_mappings: >-
+          {{
+            ilo5_current_ldap_mappings
+            +
+            [
+              {
+                'LocalRole': item.get('LocalRole', ''),
+                'RemoteGroup': item.get('RemoteGroup', '')
+              }
+            ]
+          }}
+      loop: >-
+        {{
+          ipmi_accountservice_autodetect.json
+          .get('LDAP', {})
+          .get('RemoteRoleMapping', [])
+        }}
+      loop_control:
+        label: "{{ item.get('RemoteGroup', 'empty') }}"
+      changed_when: false
+      no_log: true
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Read current HPE iLO5 mapped directory roles
+      ansible.builtin.uri:
+        url: >-
+          {{ baseuri }}/redfish/v1/AccountService/Roles/{{
+            item.LocalRole
+          }}/
+        method: GET
+      loop: "{{ ilo5_current_ldap_mappings }}"
+      loop_control:
+        label: "{{ item.RemoteGroup }}"
+      register: ilo5_current_directory_role_reads
+      changed_when: false
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - item.LocalRole | length > 0
+
+    - name: Initialize current HPE iLO5 directory group states
+      ansible.builtin.set_fact:
+        ilo5_current_directory_group_states: []
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Build current HPE iLO5 directory group states
+      ansible.builtin.set_fact:
+        ilo5_current_directory_group_states: >-
+          {%- set remote_group = item.item.RemoteGroup | default('') -%}
+          {%- set role_dn = (
+            item.json
+            .get('Oem', {})
+            .get('Hpe', {})
+            .get('GroupDn', '')
+          ) -%}
+          {%- set role_sid = (
+            item.json
+            .get('Oem', {})
+            .get('Hpe', {})
+            .get('GroupSid', '')
+          ) -%}
+          {%- set fallback_dn = (
+            remote_group
+            | regex_replace('(?i):S-1-5-[0-9-]+$', '')
+          ) -%}
+          {%- set fallback_sid = (
+            remote_group
+            | regex_findall('(?i):(S-1-5-[0-9-]+)$')
+            | first
+            | default('')
+          ) -%}
+          {%- set group_dn = role_dn if role_dn | length > 0 else fallback_dn -%}
+          {%- set group_sid = role_sid if role_sid | length > 0 else fallback_sid -%}
+          {{
+            ilo5_current_directory_group_states
+            +
+            [
+              {
+                'key': (group_dn | lower) ~ ':' ~ (group_sid | upper),
+                'group_dn': group_dn,
+                'group_sid': group_sid,
+                'local_role': item.item.LocalRole,
+                'remote_group': remote_group,
+                'uri': item.json.get(
+                  '@odata.id',
+                  '/redfish/v1/AccountService/Roles/' ~ item.item.LocalRole ~ '/'
+                ),
+                'assigned_privileges': item.json.get('AssignedPrivileges', []),
+                'oem_privileges': item.json.get('OemPrivileges', [])
+              }
+            ]
+          }}
+      loop: "{{ ilo5_current_directory_role_reads.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.RemoteGroup | default('unknown') }}"
+      changed_when: false
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - not (item.skipped | default(false))
+        - item.json is defined
+
+    # ----------------------------------------------------------------------
+    # Задача: Build HPE iLO5 RemoteRoleMapping PATCH payload
+    # Существующие корректные DN+SID сохраняют свой LocalRole dirgroup*.
+    # Группа с неверным SID считается отсутствующей: старая запись удаляется,
+    # а новая создаётся из Administrator/Operator и затем получает точные права.
+    - name: Initialize HPE iLO5 RemoteRoleMapping payload
+      ansible.builtin.set_fact:
+        ilo5_desired_mapping_payload: []
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Build HPE iLO5 RemoteRoleMapping payload
+      ansible.builtin.set_fact:
+        ilo5_desired_mapping_payload: >-
+          {%- set desired_key = item.key -%}
+          {%- set existing = (
+            ilo5_current_directory_group_states
+            | selectattr('key', 'equalto', desired_key)
+            | list
+            | first
+            | default({})
+          ) -%}
+          {{
+            ilo5_desired_mapping_payload
+            +
+            [
+              {
+                'LocalRole': existing.get('local_role', item.SeedRole),
+                'RemoteGroup': existing.get('remote_group', item.RemoteGroup)
+              }
+            ]
+          }}
+      loop: "{{ ipmi_desired_ilo5_mappings }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+      no_log: true
+      when: ipmi_detected_type == 'ilo5'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current Supermicro EthernetInterface
+    # Читаем текущие DNS и IPv6-параметры первого интерфейса Supermicro.
+
+    - name: Read current Supermicro EthernetInterface
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/redfish/v1/Managers/1/EthernetInterfaces/1"
+        method: GET
+      register: supermicro_network_current
+      changed_when: false
+      when: ipmi_detected_type == 'supermicro'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current Supermicro NTP settings
+    # Читаем текущие NTP-серверы и флаги времени Supermicro для расчёта drift.
+
+    - name: Read current Supermicro NTP settings
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/redfish/v1/Managers/1/NTP"
+        method: GET
+      register: supermicro_ntp_current
+      changed_when: false
+      when: ipmi_detected_type == 'supermicro'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read current Supermicro Active Directory settings
+    # Читаем текущие параметры Active Directory/LDAPS Supermicro для точного сравнения.
+
+    - name: Read current Supermicro Active Directory settings
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory"
+        method: GET
+      register: supermicro_ad_current
+      changed_when: false
+      when: ipmi_detected_type == 'supermicro'
+
+    # ----------------------------------------------------------------------
+    # Задача: Calculate HPE iLO5 drift
+    # Сравниваем текущее состояние iLO5 с vars и формируем отдельный флаг для каждого блока настроек.
+
+    - name: Calculate HPE iLO5 drift
+      ansible.builtin.set_fact:
+        ilo5_network_drift: >-
+          {{
+            hpe_eth_current.json.get('StaticNameServers', [])
+              != [ipmi_dns_primary, ipmi_dns_secondary]
+            or
+            (hpe_eth_current.json.get('DHCPv4', {}).get('UseDNSServers', true) | bool)
+            or
+            hpe_eth_current.json.get('DHCPv6', {}).get('OperatingMode', '') != 'Disabled'
+            or
+            (hpe_eth_current.json.get('DHCPv6', {}).get('UseDNSServers', true) | bool)
+            or
+            (hpe_eth_current.json.get('DHCPv6', {}).get('UseDomainName', true) | bool)
+            or
+            (hpe_eth_current.json.get('DHCPv6', {}).get('UseRapidCommit', true) | bool)
+            or
+            (hpe_eth_current.json.get('StatelessAddressAutoConfig', {}).get('IPv6AutoConfigEnabled', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv4', {}).get('UseDNSServers', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv4', {}).get('UseWINSServers', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv6', {}).get('StatefulModeEnabled', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv6', {}).get('StatelessModeEnabled', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv6', {}).get('UseDNSServers', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv6', {}).get('UseDomainName', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv6', {}).get('UseRapidCommit', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('IPv4', {}).get('DDNSRegistration', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('IPv4', {}).get('WINSRegistration', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('IPv6', {}).get('DDNSRegistration', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('IPv6', {}).get('SLAACEnabled', true) | bool)
+          }}
+        ilo5_ipv6_ribcl_drift: >-
+          {{
+            hpe_network_state.ipv6_preferred_protocol | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.ipv6_addr_autocfg | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.ipv6_reg_ddns_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_stateless_enable | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_stateful_enable | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_rapid_commit | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_domain_name | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_dns_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+          }}
+        ilo5_ntp_dhcp_drift: >-
+          {{
+            (hpe_eth_current.json.get('DHCPv6', {}).get('UseNTPServers', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv4', {}).get('UseNTPServers', true) | bool)
+            or
+            (hpe_eth_current.json.get('Oem', {}).get('Hpe', {}).get('DHCPv6', {}).get('UseNTPServers', true) | bool)
+            or
+            hpe_network_state.dhcpv6_sntp_settings | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+          }}
+        ilo5_datetime_drift: >-
+          {{
+            ilo5_datetime_current.json.get('StaticNTPServers', [])
+              != [ipmi_ntp_primary, ipmi_ntp_secondary]
+            or
+            (ilo5_datetime_current.json.get('TimeZone', {}).get('Index', -1) | int)
+              != (ipmi_ilo5_timezone_index | int)
+          }}
+        ilo5_ldap_service_drift: >-
+          {{
+            ipmi_accountservice_autodetect.json.get('LDAP', {}).get('AccountProviderType', '')
+              != 'LDAPService'
+            or
+            not (
+              ipmi_accountservice_autodetect.json.get('LDAP', {}).get('ServiceEnabled', false)
+              | bool
+            )
+            or
+            ipmi_accountservice_autodetect.json.get('LDAP', {}).get('ServiceAddresses', [])
+              != [ipmi_directory_server]
+          }}
+        ilo5_ldap_context_drift: >-
+          {{
+            ipmi_accountservice_autodetect.json
+              .get('LDAP', {})
+              .get('LDAPService', {})
+              .get('SearchSettings', {})
+              .get('BaseDistinguishedNames', [])
+              != ['']
+          }}
+        ilo5_ldap_group_drift: >-
+          {{
+            (
+              ilo5_current_directory_group_states
+              | map(attribute='key')
+              | list
+              | sort
+            )
+            !=
+            (
+              ipmi_desired_ilo5_mappings
+              | map(attribute='key')
+              | list
+              | sort
+            )
+          }}
+        ilo5_ca_drift: >-
+          {{
+            ilo5_ldap_ca_collection.json.get('Members@odata.count', 0) | int == 0
+            or
+            (
+              ilo5_ldap_ca_current.json.get('SerialNumber', '')
+              | regex_replace(':', '')
+              | upper
+            ) != local_ldap_ca_serial
+          }}
+      when: ipmi_detected_type == 'ilo5'
+
+    # ----------------------------------------------------------------------
+    # Задача: Calculate HPE iLO4 drift
+    # Сравниваем распарсенные RIBCL/Redfish значения iLO4 с vars по каждому изменяемому блоку.
+
+    - name: Calculate HPE iLO4 drift
+      ansible.builtin.set_fact:
+        ilo4_network_drift: >-
+          {{
+            hpe_network_state.dhcp_dns_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.prim_dns_server != ipmi_dns_primary
+            or hpe_network_state.sec_dns_server != ipmi_dns_secondary
+            or hpe_network_state.ter_dns_server != '0.0.0.0'
+            or hpe_network_state.dhcp_wins_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.reg_wins_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.prim_wins_server != '0.0.0.0'
+            or hpe_network_state.sec_wins_server != '0.0.0.0'
+            or hpe_network_state.reg_ddns_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.ipv6_preferred_protocol | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.ipv6_addr_autocfg | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.ipv6_reg_ddns_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_stateless_enable | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_stateful_enable | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_rapid_commit | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_domain_name | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_dns_server | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.ipv6_prim_dns_server != '::'
+            or hpe_network_state.ipv6_sec_dns_server != '::'
+            or hpe_network_state.ipv6_ter_dns_server != '::'
+            or hpe_network_state.ipv6_default_gateway != '::'
+          }}
+        ilo4_sntp_drift: >-
+          {{
+            hpe_network_state.dhcp_sntp_settings | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.dhcpv6_sntp_settings | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+            or hpe_network_state.sntp_server1 != ipmi_ntp_primary
+            or hpe_network_state.sntp_server2 != ipmi_ntp_secondary
+            or hpe_network_state.timezone != ipmi_ilo4_timezone
+          }}
+        ilo4_directory_drift: >-
+          {{
+            ilo4_directory_state.authentication_enabled | upper not in ['Y', 'YES', 'TRUE', '1', 'ENABLED']
+            or ilo4_directory_state.local_user_acct | upper not in ['Y', 'YES', 'TRUE', '1', 'ENABLED']
+            or ilo4_directory_state.server_address != ipmi_directory_server
+            or (ilo4_directory_state.server_port | int) != (ipmi_directory_ldap_port | int)
+            or ilo4_directory_state.group_enabled | upper not in ['Y', 'YES', 'TRUE', '1', 'ENABLED']
+            or ilo4_current_directory_groups != ipmi_desired_ilo4_groups
+          }}
+        ilo4_user_context_drift: "{{ ilo4_directory_state.user_context_1 != '' }}"
+        ilo4_generic_ldap_drift: >-
+          {{
+            ilo4_directory_state.generic_ldap_enabled
+            | upper
+            not in ['Y', 'YES', 'TRUE', '1', 'ENABLED']
+          }}
+      when: ipmi_detected_type == 'ilo4'
+
+    # ----------------------------------------------------------------------
+    # Задача: Calculate Supermicro drift
+    # Сравниваем DNS, NTP, часовой пояс и Active Directory Supermicro с рассчитанным состоянием.
+    # IPv6 здесь намеренно не управляется: протестированная прошивка Supermicro
+    # не принимает DHCPv6, StatelessAddressAutoConfig и Oem в PATCH EthernetInterface.
+
+    - name: Calculate Supermicro drift
+      ansible.builtin.set_fact:
+        supermicro_dns_drift: >-
+          {{
+            (
+              supermicro_network_current.json.get('NameServers', '')
+              if supermicro_network_current.json.get('NameServers', '') is string
+              else (
+                supermicro_network_current.json.get('NameServers', [])
+                | first
+                | default('')
+              )
+            ) != ipmi_dns_primary
+          }}
+        supermicro_ntp_drift: >-
+          {{
+            not (supermicro_ntp_current.json.get('NTPEnable', false) | bool)
+            or supermicro_ntp_current.json.get('PrimaryNTPServer', '') != ipmi_ntp_primary
+            or supermicro_ntp_current.json.get('SecondaryNTPServer', '') != ipmi_ntp_secondary
+            or (supermicro_ntp_current.json.get('DaylightSavingTime', true) | bool)
+          }}
+        supermicro_timezone_drift: >-
+          {{
+            ipmi_manager_autodetect.json.get('DateTimeLocalOffset', '')
+              != ipmi_supermicro_timezone
+          }}
+        supermicro_ad_drift: >-
+          {{
+            not (supermicro_ad_current.json.get('AuthenticationEnabled', false) | bool)
+            or not (supermicro_ad_current.json.get('AuthenticationOverSSLEnabled', false) | bool)
+            or (supermicro_ad_current.json.get('PortNumber', 0) | int) != 636
+            or supermicro_ad_current.json.get('UserDomainName', '') != ipmi_directory_server
+            or (supermicro_ad_current.json.get('Timeout', 0) | int) != 10
+            or supermicro_ad_current.json.get('DCSAddress1', '') != ipmi_dns_primary
+            or supermicro_ad_current.json.get('DCSAddress2', '') != ipmi_dns_secondary
+            or supermicro_ad_current.json.get('DCSAddress3', '') != '0.0.0.0'
+          }}
+      when: ipmi_detected_type == 'supermicro'
+
+    # ----------------------------------------------------------------------
+    # Задача: Show detected configuration drift
+    # Показываем только рассчитанные флаги расхождений перед изменениями.
+    # Задача диагностическая и никогда не помечает хост как changed.
+
+    - name: Show detected configuration drift
+      ansible.builtin.debug:
+        msg:
+          detected_type: "{{ ipmi_detected_type }}"
+          desired_directory_groups: >-
+            {{
+              ipmi_desired_directory_groups
+              | map(attribute='name')
+              | list
+            }}
+          hpe_ilo5:
+            network_redfish: "{{ ilo5_network_drift | default(false) }}"
+            ipv6_ribcl: "{{ ilo5_ipv6_ribcl_drift | default(false) }}"
+            ntp_dhcp: "{{ ilo5_ntp_dhcp_drift | default(false) }}"
+            ntp_timezone: "{{ ilo5_datetime_drift | default(false) }}"
+            ldap_service: "{{ ilo5_ldap_service_drift | default(false) }}"
+            ldap_context: "{{ ilo5_ldap_context_drift | default(false) }}"
+            ldap_group: "{{ ilo5_ldap_group_drift | default(false) }}"
+            ldap_ca: "{{ ilo5_ca_drift | default(false) }}"
+          hpe_ilo4:
+            network: "{{ ilo4_network_drift | default(false) }}"
+            sntp_timezone: "{{ ilo4_sntp_drift | default(false) }}"
+            directory_group: "{{ ilo4_directory_drift | default(false) }}"
+            user_context: "{{ ilo4_user_context_drift | default(false) }}"
+            generic_ldap: "{{ ilo4_generic_ldap_drift | default(false) }}"
+            ldap_ca: "{{ ilo4_ca_drift | default(false) }}"
+            ldap_ca_comparison: "{{ ilo4_ca_comparison_mode | default('not_applicable') }}"
+          supermicro:
+            dns: "{{ supermicro_dns_drift | default(false) }}"
+            ntp: "{{ supermicro_ntp_drift | default(false) }}"
+            timezone: "{{ supermicro_timezone_drift | default(false) }}"
+            active_directory: "{{ supermicro_ad_drift | default(false) }}"
+
     ###########################################################################
     # Network / DNS / DDNS / WINS / IPv6
     ###########################################################################
@@ -299,6 +1421,7 @@
     # Задача: Configure DNS, DDNS, WINS and IPv6 off for HPE iLO5 via Redfish
     # Настраиваем сетевые параметры iLO5 через Redfish.
     # Выключаем DHCP DNS, WINS, DHCPv6, SLAAC и DDNS; прописываем статические DNS-серверы из раздела vars в начале playbook.
+
     - name: Configure DNS, DDNS, WINS and IPv6 off for HPE iLO5 via Redfish
       ansible.builtin.uri:
         url: "{{ baseuri }}{{ hpe_eth_patch_uri }}"
@@ -311,7 +1434,6 @@
             OperatingMode: "Disabled"
             UseDNSServers: false
             UseDomainName: false
-            UseNTPServers: false
             UseRapidCommit: false
           StatelessAddressAutoConfig:
             IPv6AutoConfigEnabled: false
@@ -328,7 +1450,6 @@
                 StatelessModeEnabled: false
                 UseDNSServers: false
                 UseDomainName: false
-                UseNTPServers: false
                 UseRapidCommit: false
               IPv4:
                 DDNSRegistration: false
@@ -340,13 +1461,17 @@
           - 200
           - 202
           - 204
-      when: ipmi_detected_type == 'ilo5'
-
+      register: ilo5_network_apply
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_network_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Disable IPv6 preferred protocol for HPE iLO5 via RIBCL
     # Дополнительно отключаем IPv6 preferred protocol на iLO5 через RIBCL.
     # Redfish не всегда снимает эту галку, поэтому используется старый HPE RIBCL XML endpoint.
+
     - name: Disable IPv6 preferred protocol for HPE iLO5 via RIBCL
       ansible.builtin.uri:
         url: "{{ baseuri }}/ribcl"
@@ -368,51 +1493,26 @@
                   <DHCPV6_RAPID_COMMIT VALUE="N"/>
                   <DHCPV6_DOMAIN_NAME VALUE="N"/>
                   <DHCPV6_DNS_SERVER VALUE="N"/>
-                  <DHCPV6_SNTP_SETTINGS VALUE="N"/>
                 </MOD_NETWORK_SETTINGS>
               </RIB_INFO>
             </LOGIN>
           </RIBCL>
         return_content: true
-        status_code: 200
       register: hpe_ipv6_preferred_ribcl_ilo5
-      changed_when: >
-        hpe_ipv6_preferred_ribcl_ilo5.status == 200 and
-        ('0x0000' in (hpe_ipv6_preferred_ribcl_ilo5.content | default('')))
+      changed_when: true
       failed_when: >
         hpe_ipv6_preferred_ribcl_ilo5.status != 200 or
         ('0x0000' not in (hpe_ipv6_preferred_ribcl_ilo5.content | default('')))
       no_log: true
-      when: ipmi_detected_type == 'ilo5'
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Disable DHCP DNS flag for HPE iLO4 via Redfish
-    # Для iLO4 сначала пробуем снять DHCP DNS-флаги через Redfish.
-    # Это предварительный шаг перед RIBCL, потому что у iLO4 часть сетевых параметров лучше применяется через разные механизмы.
-    - name: Disable DHCP DNS flag for HPE iLO4 via Redfish
-      ansible.builtin.uri:
-        url: "{{ baseuri }}{{ hpe_eth_patch_uri }}"
-        method: PATCH
-        body_format: json
-        body:
-          Oem:
-            Hp:
-              DHCPv4:
-                UseDNSServers: false
-              DHCPv6:
-                UseDNSServers: false
-        status_code:
-          - 200
-          - 202
-          - 204
-      when: ipmi_detected_type == 'ilo4'
-
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ipv6_ribcl_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Configure static DNS, DDNS and IPv6 off for HPE iLO4 via RIBCL
     # Основная настройка сети для iLO4 через RIBCL.
     # Прописываем статические DNS, выключаем DHCP DNS, WINS registration, DDNS и IPv6/DHCPv6 настройки.
+
     - name: Configure static DNS, DDNS and IPv6 off for HPE iLO4 via RIBCL
       ansible.builtin.uri:
         url: "{{ baseuri }}/ribcl"
@@ -430,14 +1530,11 @@
                   <PRIM_DNS_SERVER VALUE="{{ ipmi_dns_primary }}"/>
                   <SEC_DNS_SERVER VALUE="{{ ipmi_dns_secondary }}"/>
                   <TER_DNS_SERVER VALUE="0.0.0.0"/>
-
                   <DHCP_WINS_SERVER VALUE="N"/>
                   <REG_WINS_SERVER VALUE="N"/>
                   <PRIM_WINS_SERVER VALUE="0.0.0.0"/>
                   <SEC_WINS_SERVER VALUE="0.0.0.0"/>
-
                   <REG_DDNS_SERVER VALUE="No"/>
-
                   <IPV6_PREFERRED_PROTOCOL VALUE="N"/>
                   <IPV6_ADDR_AUTOCFG VALUE="N"/>
                   <IPV6_REG_DDNS_SERVER VALUE="N"/>
@@ -446,8 +1543,6 @@
                   <DHCPV6_RAPID_COMMIT VALUE="N"/>
                   <DHCPV6_DOMAIN_NAME VALUE="N"/>
                   <DHCPV6_DNS_SERVER VALUE="N"/>
-                  <DHCPV6_SNTP_SETTINGS VALUE="N"/>
-
                   <IPV6_PRIM_DNS_SERVER VALUE="::"/>
                   <IPV6_SEC_DNS_SERVER VALUE="::"/>
                   <IPV6_TER_DNS_SERVER VALUE="::"/>
@@ -457,79 +1552,20 @@
             </LOGIN>
           </RIBCL>
         return_content: true
-        status_code: 200
       register: hpe_dns_ribcl_ilo4
       changed_when: true
       failed_when: >
         hpe_dns_ribcl_ilo4.status != 200 or
         ('0x0000' not in (hpe_dns_ribcl_ilo4.content | default('')))
       no_log: true
-      when: ipmi_detected_type == 'ilo4'
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_network_drift | bool
 
-
-    # ----------------------------------------------------------------------
-    # Задача: Reset HPE iLO4 after IPv6 and DHCP SNTP changes
-    # Перезапускаем iLO4 после сетевых изменений.
-    # У iLO4 часть параметров сети и IPv6 применяются только после reset самого iLO, не сервера.
-    - name: Reset HPE iLO4 after IPv6 and DHCP SNTP changes
-      ansible.builtin.uri:
-        url: "{{ baseuri }}/ribcl"
-        method: POST
-        headers:
-          Accept: "*/*"
-          Content-Type: "text/xml"
-        body_format: raw
-        body: |
-          <RIBCL VERSION="2.0">
-            <LOGIN USER_LOGIN="{{ ipmi_login | e }}" PASSWORD="{{ ipmi_password | e }}">
-              <RIB_INFO MODE="write">
-                <RESET_RIB/>
-              </RIB_INFO>
-            </LOGIN>
-          </RIBCL>
-        status_code:
-          - 200
-          - 500
-      failed_when: false
-      changed_when: true
-      no_log: true
-      when: ipmi_detected_type == 'ilo4'
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Wait for HPE iLO4 HTTPS after IPv6 and DHCP SNTP reset
-    # Ждём, пока iLO4 снова поднимет HTTPS после промежуточного reset.
-    # Без этой паузы следующие RIBCL/Redfish задачи могут попасть в момент перезагрузки web-сервиса.
-    - name: Wait for HPE iLO4 HTTPS after IPv6 and DHCP SNTP reset
-      ansible.builtin.wait_for:
-        host: "{{ inventory_hostname }}"
-        port: "{{ ipmi_https_port | int }}"
-        delay: 25
-        timeout: 180
-        state: started
-      when: ipmi_detected_type == 'ilo4'
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Verify HPE iLO4 Redfish after network reset
-    # Фэйлит текущий хост, если после промежуточного reset Redfish не вернулся.
-    - name: Verify HPE iLO4 Redfish after network reset
-      ansible.builtin.uri:
-        url: "{{ baseuri }}/redfish/v1/"
-        method: GET
-        status_code: 200
-      register: hpe_ilo4_redfish_after_network_reset
-      retries: 18
-      delay: 10
-      until: hpe_ilo4_redfish_after_network_reset.status == 200
-      changed_when: false
-      when: ipmi_detected_type == 'ilo4'
-
-
-    # ----------------------------------------------------------------------
     # Задача: Configure DNS for Supermicro via Redfish
     # Настраиваем DNS на Supermicro через Redfish.
     # Для Supermicro оставляем только primary DNS одной строкой, потому что второй DNS/массив на этой модели может ломать IPMI.
+
     - name: Configure DNS for Supermicro via Redfish
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/Managers/1/EthernetInterfaces/1"
@@ -540,52 +1576,16 @@
         status_code:
           - 200
           - 204
-      when: ipmi_detected_type == 'supermicro'
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Disable all IPv6 for Supermicro via Redfish
-    # Переводим сетевой стек Supermicro в режим IPv4, отключаем DHCPv6 и SLAAC.
-    # Если прошивка не принимает хотя бы одно свойство, задача завершается ошибкой для этого IPMI.
-    - name: Disable all IPv6 for Supermicro via Redfish
-      ansible.builtin.uri:
-        url: "{{ baseuri }}/redfish/v1/Managers/1/EthernetInterfaces/1"
-        method: PATCH
-        body_format: json
-        body:
-          DHCPv6:
-            OperatingMode: "Disabled"
-            UseDNSServers: false
-            UseDomainName: false
-            UseNTPServers: false
-            UseRapidCommit: false
-          StatelessAddressAutoConfig:
-            IPv6AutoConfigEnabled: false
-          Oem:
-            Supermicro:
-              IPProtocolStatus: "{{ ipmi_supermicro_ip_protocol }}"
-        status_code:
-          - 200
-          - 204
-      when: ipmi_detected_type == 'supermicro'
-
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - supermicro_dns_drift | bool
 
     # ----------------------------------------------------------------------
-    # Задача: Verify IPv6 is disabled for Supermicro
-    # Повторно читаем сетевой интерфейс и проверяем три ключевых признака отключения IPv6.
-    - name: Verify IPv6 is disabled for Supermicro
-      ansible.builtin.uri:
-        url: "{{ baseuri }}/redfish/v1/Managers/1/EthernetInterfaces/1"
-        method: GET
-        return_content: true
-        status_code: 200
-      register: ipmi_supermicro_ipv6_verify
-      changed_when: false
-      failed_when: >
-        ipmi_supermicro_ipv6_verify.json.DHCPv6.OperatingMode | default('') != 'Disabled' or
-        ipmi_supermicro_ipv6_verify.json.StatelessAddressAutoConfig.IPv6AutoConfigEnabled | default(true) | bool or
-        ipmi_supermicro_ipv6_verify.json.Oem.Supermicro.IPProtocolStatus | default('') != ipmi_supermicro_ip_protocol
-      when: ipmi_detected_type == 'supermicro'
+    # IPv6 для Supermicro намеренно не настраивается через этот playbook.
+    # Протестированная прошивка возвращает HTTP 400 PropertyUnknown для полей
+    # DHCPv6, StatelessAddressAutoConfig и Oem на EthernetInterface PATCH.
+    # Повторные попытки здесь не помогут, поэтому неподдерживаемые PATCH и проверка удалены.
 
     ###########################################################################
     # NTP / SNTP / Time Zone
@@ -596,12 +1596,15 @@
     # Задача: Disable DHCP-provided NTP servers on HPE iLO5 EthernetInterface settings URI
     # Отключаем получение NTP-серверов по DHCP на iLO5 через SettingsObject URI.
     # Если конкретная прошивка не принимает этот PATCH и даёт 400, ниже есть fallback на прямой интерфейс.
+
     - name: Disable DHCP-provided NTP servers on HPE iLO5 EthernetInterface settings URI
       ansible.builtin.uri:
         url: "{{ baseuri }}{{ hpe_eth_patch_uri }}"
         method: PATCH
         body_format: json
         body:
+          DHCPv6:
+            UseNTPServers: false
           Oem:
             Hpe:
               DHCPv4:
@@ -614,15 +1617,16 @@
           - 204
           - 400
       register: hpe_ntp_dhcp_patch_ilo5
-      failed_when: hpe_ntp_dhcp_patch_ilo5.status not in [200, 202, 204, 400]
       changed_when: hpe_ntp_dhcp_patch_ilo5.status in [200, 202, 204]
-      when: ipmi_detected_type == 'ilo5'
-
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ntp_dhcp_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Disable DHCP-provided NTP servers on HPE iLO5 EthernetInterface direct URI fallback
     # Fallback для iLO5: отключаем DHCP NTP через прямой EthernetInterface URI.
     # Выполняется только если предыдущий PATCH через SettingsObject вернул 400.
+
     - name: Disable DHCP-provided NTP servers on HPE iLO5 EthernetInterface direct URI fallback
       ansible.builtin.uri:
         url: >-
@@ -632,6 +1636,8 @@
         method: PATCH
         body_format: json
         body:
+          DHCPv6:
+            UseNTPServers: false
           Oem:
             Hpe:
               DHCPv4:
@@ -642,15 +1648,53 @@
           - 200
           - 202
           - 204
+      register: hpe_ntp_dhcp_patch_fallback_ilo5
+      changed_when: true
       when:
         - ipmi_detected_type == 'ilo5'
-        - hpe_ntp_dhcp_patch_ilo5.status == 400
-
+        - ilo5_ntp_dhcp_drift | bool
+        - (hpe_ntp_dhcp_patch_ilo5.status | default(0) | int) == 400
 
     # ----------------------------------------------------------------------
     # Задача: Configure NTP servers and Time Zone for HPE iLO5 via Redfish
     # Настраиваем NTP и timezone для iLO5 через Redfish DateTime.
     # NTP и индекс timezone заданы в разделе vars в начале playbook.
+
+    - name: Disable DHCPv6 SNTP flag for HPE iLO5 via RIBCL
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/ribcl"
+        method: POST
+        headers:
+          Accept: "*/*"
+          Content-Type: "text/xml"
+        body_format: raw
+        body: |
+          <RIBCL VERSION="2.0">
+            <LOGIN USER_LOGIN="{{ ipmi_login | e }}" PASSWORD="{{ ipmi_password | e }}">
+              <RIB_INFO MODE="write">
+                <MOD_NETWORK_SETTINGS>
+                  <DHCPV6_SNTP_SETTINGS VALUE="N"/>
+                </MOD_NETWORK_SETTINGS>
+              </RIB_INFO>
+            </LOGIN>
+          </RIBCL>
+        return_content: true
+      register: hpe_ntp_dhcp_ribcl_ilo5
+      changed_when: true
+      failed_when: >
+        hpe_ntp_dhcp_ribcl_ilo5.status != 200 or
+        ('0x0000' not in (hpe_ntp_dhcp_ribcl_ilo5.content | default('')))
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - hpe_network_state.dhcpv6_sntp_settings | upper not in ['N', 'NO', 'FALSE', '0', 'DISABLED']
+
+
+
+    # ----------------------------------------------------------------------
+    # Задача: Configure NTP servers and Time Zone for HPE iLO5 via Redfish
+    # Применяем NTP-серверы и индекс часового пояса только при ilo5_datetime_drift=true.
+
     - name: Configure NTP servers and Time Zone for HPE iLO5 via Redfish
       ansible.builtin.uri:
         url: >-
@@ -669,13 +1713,17 @@
           - 200
           - 202
           - 204
-      when: ipmi_detected_type == 'ilo5'
-
+      register: ilo5_datetime_apply
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_datetime_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Configure SNTP servers and Time Zone for HPE iLO4 via RIBCL
     # Настраиваем SNTP и timezone для iLO4 через RIBCL.
     # Отключаем DHCP SNTP, прописываем два NTP/SNTP сервера и timezone из переменной ipmi_ilo4_timezone.
+
     - name: Configure SNTP servers and Time Zone for HPE iLO4 via RIBCL
       ansible.builtin.uri:
         url: "{{ baseuri }}/ribcl"
@@ -699,20 +1747,21 @@
             </LOGIN>
           </RIBCL>
         return_content: true
-        status_code: 200
       register: hpe_sntp_ribcl_ilo4
       changed_when: true
       failed_when: >
         hpe_sntp_ribcl_ilo4.status != 200 or
         ('0x0000' not in (hpe_sntp_ribcl_ilo4.content | default('')))
       no_log: true
-      when: ipmi_detected_type == 'ilo4'
-
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_sntp_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Configure NTP for Supermicro via Redfish
     # Настраиваем NTP на Supermicro через OEM Redfish endpoint.
     # Включаем NTP, прописываем primary/secondary серверы и выключаем DaylightSavingTime.
+
     - name: Configure NTP for Supermicro via Redfish
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/Managers/1/NTP"
@@ -726,14 +1775,17 @@
         status_code:
           - 200
           - 204
-      when: ipmi_detected_type == 'supermicro'
-
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - supermicro_ntp_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Configure Time Zone for Supermicro via Redfish
     # Выставляем для Supermicro смещение локального времени UTC+05:00.
     # Redfish Manager принимает значение DateTimeLocalOffset в формате +HH:MM.
-    - name: Configure Time Zone UTC+05:00 for Supermicro via Redfish
+
+    - name: Configure Time Zone for Supermicro via Redfish
       ansible.builtin.uri:
         url: >-
           {{ baseuri }}{{
@@ -746,7 +1798,10 @@
         status_code:
           - 200
           - 204
-      when: ipmi_detected_type == 'supermicro'
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - supermicro_timezone_drift | bool
 
     ###########################################################################
     # HPE AccountService / LDAP CA
@@ -754,9 +1809,29 @@
 
 
     # ----------------------------------------------------------------------
+    # Задача: Delete incorrect LDAP CA certificate from HPE iLO5
+    # Удаляем существующий сертификат только когда его SerialNumber отличается от локального CA.
+    # Допустимы стандартные успешные ответы Redfish: 200, 202 и 204.
+
+    - name: Delete incorrect LDAP CA certificate from HPE iLO5
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ ilo5_ldap_ca_collection.json.Members[0]['@odata.id'] }}"
+        method: DELETE
+        status_code:
+          - 200
+          - 202
+          - 204
+      register: hpe_ca_delete_ilo5
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ca_drift | bool
+        - ilo5_ldap_ca_collection.json.get('Members@odata.count', 0) | int > 0
+
+    # ----------------------------------------------------------------------
     # Задача: Import LDAP CA certificate for HPE iLO5
-    # Загружаем CA-сертификат LDAP/LDAPS в iLO5 через Redfish.
-    # HTTP 409 считаем допустимым, потому что он обычно означает, что такой сертификат уже есть.
+    # Импортируем локальный CA только при подтверждённом расхождении сертификата.
+
     - name: Import LDAP CA certificate for HPE iLO5
       ansible.builtin.uri:
         url: >-
@@ -766,18 +1841,18 @@
         method: POST
         body_format: json
         body:
-          CertificateString: "{{ lookup('file', playbook_dir ~ '/../../' ~ ipmi_directory_ca_certificate) }}"
+          CertificateString: "{{ lookup('file', ipmi_directory_ca_certificate) }}"
           CertificateType: "PEM"
         status_code:
           - 200
           - 201
           - 202
           - 204
-          - 409
       register: hpe_ca_import_ilo5
-      changed_when: hpe_ca_import_ilo5.status in [200, 201, 202, 204]
-      failed_when: hpe_ca_import_ilo5.status not in [200, 201, 202, 204, 409]
-      when: ipmi_detected_type == 'ilo5'
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ca_drift | bool
 
     ###########################################################################
     # Directory / Generic LDAP / Active Directory
@@ -788,6 +1863,7 @@
     # Задача: Enable Generic LDAP authentication over LDAPS for HPE iLO5
     # Включаем Generic LDAP на iLO5.
     # Указываем LDAPService, включаем сервис и задаём Directory Server Address из раздела vars в начале playbook.
+
     - name: Enable Generic LDAP authentication over LDAPS for HPE iLO5
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/AccountService/"
@@ -803,13 +1879,17 @@
           - 200
           - 202
           - 204
-      when: ipmi_detected_type == 'ilo5'
-
+      register: ilo5_ldap_service_apply
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ldap_service_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Clear Generic LDAP User Contexts for HPE iLO5
     # Очищаем User Context для Generic LDAP на iLO5.
     # Это нужно, чтобы вход по user@nls.local не дополнялся лишним Base DN/User Context.
+
     - name: Clear Generic LDAP User Contexts for HPE iLO5
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/AccountService/"
@@ -825,35 +1905,364 @@
           - 200
           - 202
           - 204
-      when: ipmi_detected_type == 'ilo5'
-
+      register: ilo5_ldap_context_apply
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ldap_context_drift | bool
 
     # ----------------------------------------------------------------------
-    # Задача: Configure Generic LDAP group mapping for HPE iLO5
-    # Настраиваем сопоставление AD-группы с локальной ролью Administrator на iLO5.
-    # RemoteGroup указывается как DN группы плюс SID, чтобы iLO корректно авторизовал членов группы.
-    - name: Configure Generic LDAP group mapping for HPE iLO5
+    # Задача: Synchronize Generic LDAP group mappings for HPE iLO5
+    # Передаём полный рассчитанный список. Этим одновременно добавляются
+    # нужные группы, исправляются роли и удаляются лишние сопоставления,
+    # включая Authenticated Users / S-1-5-11.
+    - name: Synchronize Generic LDAP group mappings for HPE iLO5
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/AccountService/"
         method: PATCH
         body_format: json
         body:
           LDAP:
-            RemoteRoleMapping:
-              - LocalRole: "{{ ipmi_directory_role }}"
-                RemoteGroup: "{{ ipmi_directory_group_dn }}:{{ ipmi_directory_group_sid }}"
+            RemoteRoleMapping: "{{ ilo5_desired_mapping_payload }}"
         status_code:
           - 200
           - 202
           - 204
-      when: ipmi_detected_type == 'ilo5'
-
+      register: ilo5_ldap_group_apply
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_ldap_group_drift | bool
 
     # ----------------------------------------------------------------------
-    # Задача: Configure Directory and group for HPE iLO4 via RIBCL
-    # Настраиваем Directory authentication и группу на iLO4 через RIBCL.
-    # Включаем Directory, оставляем локальные учётки, задаём сервер LDAP/LDAPS, порт, DN группы, SID и права 1-6.
-    - name: Configure Directory and group for HPE iLO4 via RIBCL
+    # Задача: Read HPE iLO5 mappings after membership synchronization
+    # Читаем AccountService повторно: при создании группы iLO заменяет
+    # начальный Administrator/Operator на новый внутренний LocalRole dirgroup*.
+    - name: Read HPE iLO5 AccountService after group synchronization
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/redfish/v1/AccountService/"
+        method: GET
+      register: ilo5_accountservice_after_group_sync
+      changed_when: false
+      retries: 10
+      delay: 3
+      until: >-
+        ilo5_accountservice_after_group_sync.status == 200
+        and
+        (
+          ilo5_accountservice_after_group_sync.json
+          .get('LDAP', {})
+          .get('RemoteRoleMapping', [])
+          | length
+        ) == (ipmi_desired_ilo5_mappings | length)
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Initialize final HPE iLO5 LDAP mappings
+      ansible.builtin.set_fact:
+        ilo5_final_ldap_mappings: []
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Build final HPE iLO5 LDAP mappings
+      ansible.builtin.set_fact:
+        ilo5_final_ldap_mappings: >-
+          {{
+            ilo5_final_ldap_mappings
+            +
+            [
+              {
+                'LocalRole': item.get('LocalRole', ''),
+                'RemoteGroup': item.get('RemoteGroup', '')
+              }
+            ]
+          }}
+      loop: >-
+        {{
+          ilo5_accountservice_after_group_sync.json
+          .get('LDAP', {})
+          .get('RemoteRoleMapping', [])
+        }}
+      loop_control:
+        label: "{{ item.get('RemoteGroup', 'empty') }}"
+      changed_when: false
+      no_log: true
+      when: ipmi_detected_type == 'ilo5'
+
+    # ----------------------------------------------------------------------
+    # Задача: Read HPE iLO5 generated directory roles
+    # Из ресурсов Roles/dirgroup* получаем фактические GroupDn, GroupSid
+    # и точные списки привилегий.
+    - name: Read HPE iLO5 generated directory roles
+      ansible.builtin.uri:
+        url: >-
+          {{ baseuri }}/redfish/v1/AccountService/Roles/{{
+            item.LocalRole
+          }}/
+        method: GET
+        status_code:
+          - 200
+          - 404
+      loop: "{{ ilo5_final_ldap_mappings }}"
+      loop_control:
+        label: "{{ item.RemoteGroup }}"
+      register: ilo5_directory_role_reads
+      changed_when: false
+      retries: 10
+      delay: 3
+      until: ilo5_directory_role_reads.status == 200
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - item.LocalRole | length > 0
+
+    - name: Initialize final HPE iLO5 directory group states
+      ansible.builtin.set_fact:
+        ilo5_final_directory_group_states: []
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Build final HPE iLO5 directory group states
+      ansible.builtin.set_fact:
+        ilo5_final_directory_group_states: >-
+          {%- set remote_group = item.item.RemoteGroup | default('') -%}
+          {%- set role_dn = (
+            item.json
+            .get('Oem', {})
+            .get('Hpe', {})
+            .get('GroupDn', '')
+          ) -%}
+          {%- set role_sid = (
+            item.json
+            .get('Oem', {})
+            .get('Hpe', {})
+            .get('GroupSid', '')
+          ) -%}
+          {%- set fallback_dn = (
+            remote_group
+            | regex_replace('(?i):S-1-5-[0-9-]+$', '')
+          ) -%}
+          {%- set fallback_sid = (
+            remote_group
+            | regex_findall('(?i):(S-1-5-[0-9-]+)$')
+            | first
+            | default('')
+          ) -%}
+          {%- set group_dn = role_dn if role_dn | length > 0 else fallback_dn -%}
+          {%- set group_sid = role_sid if role_sid | length > 0 else fallback_sid -%}
+          {{
+            ilo5_final_directory_group_states
+            +
+            [
+              {
+                'key': (group_dn | lower) ~ ':' ~ (group_sid | upper),
+                'group_dn': group_dn,
+                'group_sid': group_sid,
+                'local_role': item.item.LocalRole,
+                'remote_group': remote_group,
+                'uri': item.json.get(
+                  '@odata.id',
+                  '/redfish/v1/AccountService/Roles/' ~ item.item.LocalRole ~ '/'
+                ),
+                'assigned_privileges': item.json.get('AssignedPrivileges', []),
+                'oem_privileges': item.json.get('OemPrivileges', [])
+              }
+            ]
+          }}
+      loop: "{{ ilo5_directory_role_reads.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.RemoteGroup | default('unknown') }}"
+      changed_when: false
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - not (item.skipped | default(false))
+        - item.json is defined
+
+    - name: Validate final HPE iLO5 LDAP mapping membership
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              ilo5_final_directory_group_states
+              | map(attribute='key')
+              | list
+              | sort
+            )
+            ==
+            (
+              ipmi_desired_ilo5_mappings
+              | map(attribute='key')
+              | list
+              | sort
+            )
+          - >-
+            (
+              ilo5_final_directory_group_states
+              | selectattr('local_role', 'equalto', '')
+              | list
+              | length
+            ) == 0
+        fail_msg: >-
+          iLO5 {{ inventory_hostname }} не сохранил рассчитанные DN/SID
+          Directory Groups после PATCH AccountService.
+        quiet: true
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Initialize HPE iLO5 directory role update list
+      ansible.builtin.set_fact:
+        ilo5_directory_roles_to_update: []
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Find HPE iLO5 directory roles with incorrect privileges
+      ansible.builtin.set_fact:
+        ilo5_directory_roles_to_update: >-
+          {%- set desired = (
+            ipmi_desired_ilo5_mappings
+            | selectattr('key', 'equalto', item.key)
+            | list
+            | first
+            | default({})
+          ) -%}
+          {%- set desired_assigned = (
+            ipmi_ilo5_full_assigned_privileges
+            if desired.get('profile', '') == 'full'
+            else ipmi_ilo5_limited_assigned_privileges
+          ) -%}
+          {%- set desired_oem = (
+            ilo5_administrator_role.json.get('OemPrivileges', [])
+            if desired.get('profile', '') == 'full'
+            else ipmi_ilo5_limited_oem_privileges
+          ) -%}
+          {{
+            ilo5_directory_roles_to_update
+            +
+            (
+              [
+                {
+                  'name': desired.get('name', item.group_dn),
+                  'remote_group': item.remote_group,
+                  'uri': item.uri,
+                  'assigned_privileges': desired_assigned,
+                  'oem_privileges': desired_oem
+                }
+              ]
+              if
+                (
+                  item.assigned_privileges | sort
+                ) != (
+                  desired_assigned | sort
+                )
+                or
+                (
+                  item.oem_privileges | sort
+                ) != (
+                  desired_oem | sort
+                )
+              else []
+            )
+          }}
+      loop: "{{ ilo5_final_directory_group_states }}"
+      loop_control:
+        label: "{{ item.group_dn }}"
+      changed_when: false
+      no_log: true
+      when: ipmi_detected_type == 'ilo5'
+
+    - name: Show HPE iLO5 directory privilege drift
+      ansible.builtin.debug:
+        msg:
+          roles_to_update: >-
+            {{
+              ilo5_directory_roles_to_update
+              | map(attribute='name')
+              | list
+            }}
+      changed_when: false
+      when: ipmi_detected_type == 'ilo5'
+
+    # ----------------------------------------------------------------------
+    # Задача: Synchronize HPE iLO5 directory group privileges
+    # Для fullaccess задаём полный поддерживаемый набор без ConfigureComponents.
+    # Для pd/ot/devs оставляем только Login, Console, Power/Reset и Virtual Media.
+    - name: Synchronize HPE iLO5 directory group privileges
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ item.uri }}"
+        method: PATCH
+        body_format: json
+        body:
+          AssignedPrivileges: "{{ item.assigned_privileges }}"
+          OemPrivileges: "{{ item.oem_privileges }}"
+        status_code:
+          - 200
+          - 202
+          - 204
+      loop: "{{ ilo5_directory_roles_to_update }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: ilo5_ldap_role_apply
+      changed_when: true
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_directory_roles_to_update | length > 0
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify updated HPE iLO5 directory group privileges
+    - name: Read updated HPE iLO5 directory roles
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ item.uri }}"
+        method: GET
+      loop: "{{ ilo5_directory_roles_to_update }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: ilo5_directory_role_verify_reads
+      changed_when: false
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - ilo5_directory_roles_to_update | length > 0
+
+    - name: Validate updated HPE iLO5 directory group privileges
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              item.json.get('AssignedPrivileges', [])
+              | sort
+            )
+            ==
+            (
+              item.item.assigned_privileges
+              | sort
+            )
+          - >-
+            (
+              item.json.get('OemPrivileges', [])
+              | sort
+            )
+            ==
+            (
+              item.item.oem_privileges
+              | sort
+            )
+        fail_msg: >-
+          iLO5 {{ inventory_hostname }} не сохранил требуемые права
+          Directory Group {{ item.item.name }}.
+        quiet: true
+      loop: "{{ ilo5_directory_role_verify_reads.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name | default('unknown') }}"
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - not (item.skipped | default(false))
+        - item.json is defined
+
+    # ----------------------------------------------------------------------
+    # Задача: Synchronize Directory groups for HPE iLO4 via RIBCL
+    # Полностью переписываем DIR_GRPACCT1..6 в фиксированном порядке.
+    # Пустыми значениями очищаются лишние группы и Authenticated Users.
+    - name: Synchronize Directory groups for HPE iLO4 via RIBCL
       ansible.builtin.uri:
         url: "{{ baseuri }}/ribcl"
         method: POST
@@ -868,26 +2277,22 @@
                 <MOD_DIR_CONFIG>
                   <DIR_AUTHENTICATION_ENABLED VALUE="Yes"/>
                   <DIR_LOCAL_USER_ACCT VALUE="Yes"/>
-
                   <DIR_SERVER_ADDRESS VALUE="{{ ipmi_directory_server }}"/>
                   <DIR_SERVER_PORT VALUE="{{ ipmi_directory_ldap_port }}"/>
-
                   <DIR_ENABLE_GRP_ACCT VALUE="Yes"/>
-                  <DIR_GRPACCT1_NAME VALUE="{{ ipmi_directory_group_dn }}"/>
-                  <DIR_GRPACCT1_PRIV VALUE="{{ ipmi_ilo4_directory_privileges }}"/>
-                  <DIR_GRPACCT1_SID VALUE="{{ ipmi_directory_group_sid }}"/>
+                  {% for slot in range(1, 7) %}
+                  {% set group = ipmi_desired_ilo4_groups[slot - 1] if (slot - 1) < (ipmi_desired_ilo4_groups | length) else {} %}
+                  <DIR_GRPACCT{{ slot }}_NAME VALUE="{{ group.get('name', '') | e }}"/>
+                  <DIR_GRPACCT{{ slot }}_PRIV VALUE="{{ group.get('privileges', '') | e }}"/>
+                  <DIR_GRPACCT{{ slot }}_SID VALUE="{{ group.get('sid', '') | e }}"/>
+                  {% endfor %}
                 </MOD_DIR_CONFIG>
               </DIR_INFO>
             </LOGIN>
           </RIBCL>
         return_content: true
-        status_code:
-          - 200
-          - 500
       register: hpe_directory_ribcl_ilo4
-      changed_when: >
-        hpe_directory_ribcl_ilo4.status == 200 and
-        ('0x0000' in (hpe_directory_ribcl_ilo4.content | default('')))
+      changed_when: true
       failed_when: >
         hpe_directory_ribcl_ilo4.status != 200 or
         ('0x0000' not in (hpe_directory_ribcl_ilo4.content | default('')))
@@ -896,13 +2301,16 @@
       until: >
         hpe_directory_ribcl_ilo4.status == 200 and
         ('0x0000' in (hpe_directory_ribcl_ilo4.content | default('')))
-      when: ipmi_detected_type == 'ilo4'
-
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_directory_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Clear Directory User Context 1 for HPE iLO4 via RIBCL
     # Очищаем User Context 1 на iLO4.
     # Это нужно, чтобы доменный логин не ломался из-за старого/лишнего контекста пользователя.
+
     - name: Clear Directory User Context 1 for HPE iLO4 via RIBCL
       ansible.builtin.uri:
         url: "{{ baseuri }}/ribcl"
@@ -922,27 +2330,30 @@
             </LOGIN>
           </RIBCL>
         return_content: true
-        status_code: 200
       register: hpe_clear_user_context_ilo4
-      changed_when: >
-        hpe_clear_user_context_ilo4.status == 200 and
-        ('0x0000' in (hpe_clear_user_context_ilo4.content | default('')))
+      changed_when: true
       failed_when: >
         hpe_clear_user_context_ilo4.status != 200 or
         ('0x0000' not in (hpe_clear_user_context_ilo4.content | default('')))
       no_log: true
-      when: ipmi_detected_type == 'ilo4'
-
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_user_context_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Wait before HPE iLO4 LDAP CA web import
     # Делаем паузу перед импортом CA на iLO4.
     # После Directory/RIBCL изменений старый web backend iLO4 может быть не готов сразу принять /json/directory запрос.
-    - name: Wait before HPE iLO4 LDAP CA web import
-      ansible.builtin.wait_for:
-        timeout: 45
-      when: ipmi_detected_type == 'ilo4'
 
+    - name: Wait before HPE iLO4 LDAP CA web check after Directory changes
+      ansible.builtin.wait_for:
+        timeout: 5
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - >
+          hpe_directory_ribcl_ilo4.changed | default(false)
+          or hpe_clear_user_context_ilo4.changed | default(false)
 
     # ----------------------------------------------------------------------
     # Задача: Login to HPE iLO4 web session for LDAP CA import
@@ -968,13 +2379,6 @@
           user_login: "{{ ipmi_login }}"
           password: "{{ ipmi_password }}"
         return_content: true
-        status_code:
-          - 200
-          - 400
-          - 401
-          - 403
-          - 404
-          - 500
       register: hpe_ilo4_web_login
       changed_when: false
       failed_when: >
@@ -1004,7 +2408,9 @@
           or
           ((hpe_ilo4_web_login.content | default('') | regex_search('"session_key"\\s*:\\s*"([^"]+)"')) is not none)
         )
-      when: ipmi_detected_type == 'ilo4'
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_ca_drift | bool
 
 
     # ----------------------------------------------------------------------
@@ -1040,13 +2446,16 @@
             )
           }}
       no_log: true
-      when: ipmi_detected_type == 'ilo4'
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_ca_drift | bool
 
 
     # ----------------------------------------------------------------------
     # Задача: Import LDAP CA certificate for HPE iLO4 via web UI endpoint
     # Импортируем LDAP CA certificate на iLO4 через внутренний web UI endpoint.
     # У iLO4 старый Redfish не умеет нормальный CA import, поэтому используется /json/directory с ca_cert_data.
+
     - name: Import LDAP CA certificate for HPE iLO4 via web UI endpoint
       ansible.builtin.uri:
         url: "{{ baseuri }}/json/directory"
@@ -1065,25 +2474,18 @@
           Cookie: "sessionKey={{ hpe_ilo4_web_session_key }}"
         body:
           method: "mod_dir_config"
-          ca_cert_data: "{{ lookup('file', playbook_dir ~ '/../../' ~ ipmi_directory_ca_certificate, rstrip=False) }}"
+          ca_cert_data: "{{ lookup('file', ipmi_directory_ca_certificate, rstrip=False) }}"
           session_key: "{{ hpe_ilo4_web_session_key }}"
-        return_content: true
-        status_code:
-          - 200
-          - 400
-          - 401
-          - 403
-          - 404
-          - 500
       register: hpe_ca_import_web_ilo4
-      changed_when: hpe_ca_import_web_ilo4.status == 200
+      changed_when: true
       failed_when: hpe_ca_import_web_ilo4.status != 200
       retries: 5
       delay: 15
       until: hpe_ca_import_web_ilo4.status == 200
       no_log: true
-      when: ipmi_detected_type == 'ilo4'
-
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - ilo4_ca_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Logout from HPE iLO4 web session after LDAP CA import
@@ -1106,11 +2508,6 @@
         body:
           method: "logout"
           session_key: "{{ hpe_ilo4_web_session_key }}"
-        return_content: true
-        status_code:
-          - 200
-          - 204
-          - 400
       changed_when: false
       failed_when: false
       no_log: true
@@ -1123,6 +2520,7 @@
     # Задача: Enable Generic LDAP for HPE iLO4 via RIBCL
     # Включаем Generic LDAP на iLO4 после импорта CA.
     # Важно делать это после CA import, потому что /json/directory может пересохранить форму Directory и сбросить чекбокс Generic LDAP.
+
     - name: Enable Generic LDAP for HPE iLO4 via RIBCL
       ansible.builtin.uri:
         url: "{{ baseuri }}/ribcl"
@@ -1143,13 +2541,8 @@
             </LOGIN>
           </RIBCL>
         return_content: true
-        status_code:
-          - 200
-          - 500
       register: hpe_generic_ldap_ribcl_ilo4
-      changed_when: >
-        hpe_generic_ldap_ribcl_ilo4.status == 200 and
-        ('0x0000' in (hpe_generic_ldap_ribcl_ilo4.content | default('')))
+      changed_when: true
       failed_when: >
         hpe_generic_ldap_ribcl_ilo4.status != 200 or
         ('0x0000' not in (hpe_generic_ldap_ribcl_ilo4.content | default('')))
@@ -1159,58 +2552,167 @@
         hpe_generic_ldap_ribcl_ilo4.status == 200 and
         ('0x0000' in (hpe_generic_ldap_ribcl_ilo4.content | default('')))
       no_log: true
-      when: ipmi_detected_type == 'ilo4'
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Read Directory config after Generic LDAP enable for HPE iLO4
-    # Читаем Directory config после включения Generic LDAP.
-    # Этот read-only шаг нужен, чтобы проверить фактическое состояние, а не верить только changed от RIBCL.
-    - name: Read Directory config after Generic LDAP enable for HPE iLO4
-      ansible.builtin.uri:
-        url: "{{ baseuri }}/ribcl"
-        method: POST
-        headers:
-          Accept: "*/*"
-          Content-Type: "text/xml"
-        body_format: raw
-        body: |
-          <RIBCL VERSION="2.0">
-            <LOGIN USER_LOGIN="{{ ipmi_login | e }}" PASSWORD="{{ ipmi_password | e }}">
-              <DIR_INFO MODE="read">
-                <GET_DIR_CONFIG/>
-              </DIR_INFO>
-            </LOGIN>
-          </RIBCL>
-        return_content: true
-        status_code:
-          - 200
-          - 500
-      register: hpe_dir_config_verify_ilo4
-      changed_when: false
-      failed_when: >
-        hpe_dir_config_verify_ilo4.status != 200 or
-        ('0x0000' not in (hpe_dir_config_verify_ilo4.content | default('')))
-      no_log: true
-      when: ipmi_detected_type == 'ilo4'
-
-
-    # ----------------------------------------------------------------------
-    # Задача: Fail if Generic LDAP is not enabled on HPE iLO4
-    # Проверяем, что Generic LDAP реально включился на iLO4.
-    # Если в GET_DIR_CONFIG нет DIR_GENERIC_LDAP_ENABLED=Yes/Y, playbook падает и не делает вид, что всё успешно.
-    - name: Fail if Generic LDAP is not enabled on HPE iLO4
-      ansible.builtin.fail:
-        msg: "Generic LDAP was not enabled on {{ inventory_hostname }} after RIBCL apply. Check iLO Directory settings manually."
       when:
         - ipmi_detected_type == 'ilo4'
-        - (hpe_dir_config_verify_ilo4.content | default('') | regex_search('DIR_GENERIC_LDAP_ENABLED[^>]+VALUE="(Yes|Y)"')) is none
-    
+        - >
+          ilo4_generic_ldap_drift | bool
+          or hpe_ca_import_web_ilo4.changed | default(false)
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify Directory config after HPE iLO4 Directory changes
+    # После изменения Directory-настроек iLO4 может временно не отвечать
+    # на GET_DIR_CONFIG. Повторяем чтение до 8 раз с паузой 10 секунд.
+    # no_log оставляем включённым, поскольку XML-запрос содержит пароль.
+    # При окончательной ошибке выводим только безопасные диагностические данные.
+    - name: Verify Directory config after HPE iLO4 Directory changes
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - >
+          hpe_directory_ribcl_ilo4.changed | default(false)
+          or hpe_clear_user_context_ilo4.changed | default(false)
+          or hpe_ca_import_web_ilo4.changed | default(false)
+          or hpe_generic_ldap_ribcl_ilo4.changed | default(false)
+      block:
+        - name: Read Directory config after HPE iLO4 Directory changes
+          ansible.builtin.uri:
+            url: "{{ baseuri }}/ribcl"
+            method: POST
+            headers:
+              Accept: "*/*"
+              Content-Type: "text/xml"
+            body_format: raw
+            body: |
+              <RIBCL VERSION="2.0">
+                <LOGIN USER_LOGIN="{{ ipmi_login | e }}" PASSWORD="{{ ipmi_password | e }}">
+                  <DIR_INFO MODE="read">
+                    <GET_DIR_CONFIG/>
+                  </DIR_INFO>
+                </LOGIN>
+              </RIBCL>
+            return_content: true
+            timeout: 30
+          register: hpe_dir_config_verify_ilo4
+          changed_when: false
+          retries: 8
+          delay: 10
+          until: >
+            hpe_dir_config_verify_ilo4.status | default(0) | int == 200
+            and '0x0000' in (hpe_dir_config_verify_ilo4.content | default(''))
+          no_log: true
+
+      rescue:
+        - name: Fail when HPE iLO4 Directory verification failed
+          ansible.builtin.fail:
+            msg: >-
+              Не удалось прочитать Directory config на HPE iLO4
+              {{ inventory_hostname }} после 8 попыток.
+              HTTP-статус:
+              {{ (hpe_dir_config_verify_ilo4 | default({})).status | default('не получен') }}.
+              Ошибка соединения:
+              {{ (hpe_dir_config_verify_ilo4 | default({})).msg | default('не указана') }}.
+              Ответы RIBCL:
+              {{
+                (
+                  (hpe_dir_config_verify_ilo4 | default({})).content
+                  | default('')
+                  | regex_findall('(?i)<RESPONSE[^>]*>')
+                  | join('; ')
+                )
+                | default('не получены', true)
+              }}
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify HPE iLO4 Directory groups after changes
+    # Повторно разбираем все шесть DIR_GRPACCT и проверяем точное совпадение
+    # с inventory, а также фактическое включение Generic LDAP.
+    - name: Initialize verified HPE iLO4 directory groups
+      ansible.builtin.set_fact:
+        ilo4_verified_directory_groups: []
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - hpe_dir_config_verify_ilo4 is defined
+        - not (hpe_dir_config_verify_ilo4.skipped | default(false))
+
+    - name: Build verified HPE iLO4 directory groups
+      ansible.builtin.set_fact:
+        ilo4_verified_directory_groups: >-
+          {%- set slot = item | string -%}
+          {%- set name_pattern = '(?i)<DIR_GRPACCT' ~ slot ~ '_NAME[^>]*VALUE *= *"([^"]*)"' -%}
+          {%- set privilege_pattern = '(?i)<DIR_GRPACCT' ~ slot ~ '_PRIV[^>]*VALUE *= *"([^"]*)"' -%}
+          {%- set sid_pattern = '(?i)<DIR_GRPACCT' ~ slot ~ '_SID[^>]*VALUE *= *"([^"]*)"' -%}
+          {%- set group_name = (
+            hpe_dir_config_verify_ilo4.content
+            | regex_findall(name_pattern)
+            | first
+            | default('')
+          ) -%}
+          {%- set group_privileges = (
+            hpe_dir_config_verify_ilo4.content
+            | regex_findall(privilege_pattern)
+            | first
+            | default('')
+            | regex_replace('\\s+', '')
+          ) -%}
+          {%- set group_sid = (
+            hpe_dir_config_verify_ilo4.content
+            | regex_findall(sid_pattern)
+            | first
+            | default('')
+          ) -%}
+          {{
+            ilo4_verified_directory_groups
+            +
+            (
+              [
+                {
+                  'name': group_name,
+                  'privileges': group_privileges,
+                  'sid': group_sid
+                }
+              ]
+              if (group_name | length > 0 or group_sid | length > 0)
+              else []
+            )
+          }}
+      loop: "{{ range(1, 7) | list }}"
+      loop_control:
+        label: "DIR_GRPACCT{{ item }}"
+      changed_when: false
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - hpe_dir_config_verify_ilo4 is defined
+        - not (hpe_dir_config_verify_ilo4.skipped | default(false))
+
+    - name: Validate HPE iLO4 Directory groups after changes
+      ansible.builtin.assert:
+        that:
+          - ilo4_verified_directory_groups == ipmi_desired_ilo4_groups
+          - >-
+            (
+              hpe_dir_config_verify_ilo4.content
+              | default('')
+              | regex_search(
+                  'DIR_GENERIC_LDAP_ENABLED[^>]+VALUE *= *"(Yes|Y)"',
+                  ignorecase=True
+                )
+            ) is not none
+        fail_msg: >-
+          iLO4 {{ inventory_hostname }} не сохранил рассчитанный список
+          Directory Groups или Generic LDAP не включился.
+        quiet: true
+      no_log: true
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - hpe_dir_config_verify_ilo4 is defined
+        - not (hpe_dir_config_verify_ilo4.skipped | default(false))
 
     # ----------------------------------------------------------------------
     # Задача: Configure Active Directory for Supermicro via Redfish
     # Настраиваем Active Directory/LDAPS на Supermicro через Redfish OEM endpoint.
     # Включаем AD auth over SSL, порт 636, домен и адреса DC.
+
     - name: Configure Active Directory for Supermicro via Redfish
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory"
@@ -1228,66 +2730,292 @@
         status_code:
           - 200
           - 204
-          - 302
-      when: ipmi_detected_type == 'supermicro'
-
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - supermicro_ad_drift | bool
 
     # ----------------------------------------------------------------------
     # Задача: Read Active Directory RoleGroups for Supermicro
-    # Читаем список RoleGroups на Supermicro.
-    # Нужно понять, создавать новую группу или обновлять уже существующую.
+    # Читаем коллекцию существующих RoleGroups.
+    # Дальше приводим её к точному списку, рассчитанному из inventory.
+
     - name: Read Active Directory RoleGroups for Supermicro
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory/RoleGroups"
         method: GET
-        return_content: true
-        status_code: 200
       register: smc_ad_rolegroups
+      changed_when: false
       when: ipmi_detected_type == 'supermicro'
 
+    # ----------------------------------------------------------------------
+    # Задача: Read existing Active Directory RoleGroups for Supermicro
+    # Коллекция содержит ссылки, поэтому читаем каждый RoleGroup по его @odata.id.
+
+    - name: Read existing Active Directory RoleGroups for Supermicro
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ item['@odata.id'] }}"
+        method: GET
+      loop: "{{ smc_ad_rolegroups.json.Members | default([]) }}"
+      loop_control:
+        label: "{{ item['@odata.id'] }}"
+      register: smc_ad_rolegroup_reads
+      changed_when: false
+      when: ipmi_detected_type == 'supermicro'
 
     # ----------------------------------------------------------------------
-    # Задача: Create Active Directory RoleGroup for Supermicro
-    # Создаём RoleGroup на Supermicro, если список групп пустой.
-    # Используем короткое имя группы ipmi_oor, домен nls.local и привилегию Administrator.
-    - name: Create Active Directory RoleGroup for Supermicro
+    # Задача: Initialize current Active Directory RoleGroups for Supermicro
+    # Создаём пустой накопительный список перед обработкой ответов RoleGroup.
+
+    - name: Initialize current Active Directory RoleGroups for Supermicro
+      ansible.builtin.set_fact:
+        smc_ad_current_groups: []
+      when: ipmi_detected_type == 'supermicro'
+
+    # ----------------------------------------------------------------------
+    # Задача: Build current Active Directory RoleGroups list for Supermicro
+    # Преобразуем ответы отдельных RoleGroup в единый список name/domain/privilege/uri.
+
+    - name: Build current Active Directory RoleGroups list for Supermicro
+      ansible.builtin.set_fact:
+        smc_ad_current_groups: >-
+          {{
+            smc_ad_current_groups
+            +
+            [
+              {
+                'name': item.json.get('RoleGroupName', ''),
+                'domain': item.json.get('RoleGroupDomain', ''),
+                'privilege': item.json.get('RoleGroupPrivilege', ''),
+                'uri': item.item['@odata.id']
+              }
+            ]
+          }}
+      loop: "{{ smc_ad_rolegroup_reads.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item['@odata.id'] | default('unknown') }}"
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - not (item.skipped | default(false))
+        - item.json is defined
+
+    # ----------------------------------------------------------------------
+    # Задача: Initialize Active Directory RoleGroup reconciliation lists for Supermicro
+    # Готовим списки на удаление, создание и обновление перед сравнением с рассчитанным состоянием.
+
+    - name: Initialize Active Directory RoleGroup reconciliation lists for Supermicro
+      ansible.builtin.set_fact:
+        smc_ad_desired_group_names: >-
+          {{ ipmi_desired_supermicro_role_groups | map(attribute='name') | list }}
+        smc_ad_current_group_names: >-
+          {{ smc_ad_current_groups | map(attribute='name') | list }}
+        smc_ad_groups_to_delete: []
+        smc_ad_groups_to_create: []
+        smc_ad_groups_to_update: []
+      when: ipmi_detected_type == 'supermicro'
+
+    # ----------------------------------------------------------------------
+    # Задача: Find unmanaged Active Directory RoleGroups for Supermicro
+    # Формируем список групп, которые есть на BMC, но отсутствуют в рассчитанном списке текущего хоста.
+
+    - name: Find unmanaged Active Directory RoleGroups for Supermicro
+      ansible.builtin.set_fact:
+        smc_ad_groups_to_delete: "{{ smc_ad_groups_to_delete + [item] }}"
+      loop: "{{ smc_ad_current_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - item.name not in smc_ad_desired_group_names
+
+    # ----------------------------------------------------------------------
+    # Задача: Find missing Active Directory RoleGroups for Supermicro
+    # Формируем список групп из inventory, которых ещё нет на BMC.
+
+    - name: Find missing Active Directory RoleGroups for Supermicro
+      ansible.builtin.set_fact:
+        smc_ad_groups_to_create: "{{ smc_ad_groups_to_create + [item] }}"
+      loop: "{{ ipmi_desired_supermicro_role_groups }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - item.name not in smc_ad_current_group_names
+
+    # ----------------------------------------------------------------------
+    # Задача: Find changed Active Directory RoleGroups for Supermicro
+    # Формируем список существующих групп с неверным доменом или уровнем привилегий.
+
+    - name: Find changed Active Directory RoleGroups for Supermicro
+      ansible.builtin.set_fact:
+        smc_ad_groups_to_update: >-
+          {{
+            smc_ad_groups_to_update
+            +
+            [
+              {
+                'name': item.0.name,
+                'domain': item.0.domain,
+                'privilege': item.0.privilege,
+                'uri': item.1.uri
+              }
+            ]
+          }}
+      loop: >-
+        {{
+          ipmi_desired_supermicro_role_groups
+          | product(smc_ad_current_groups)
+          | list
+        }}
+      loop_control:
+        label: "{{ item.0.name }}"
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - item.0.name == item.1.name
+        - >
+          item.0.domain != item.1.domain
+          or item.0.privilege != item.1.privilege
+
+    # ----------------------------------------------------------------------
+    # Задача: Delete unmanaged Active Directory RoleGroups for Supermicro
+    # Удаляем группы, отсутствующие в рассчитанном списке текущего хоста.
+
+    - name: Delete unmanaged Active Directory RoleGroups for Supermicro
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ item.uri }}"
+        method: DELETE
+        status_code:
+          - 200
+          - 202
+          - 204
+      loop: "{{ smc_ad_groups_to_delete }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - smc_ad_groups_to_delete | length > 0
+
+    # ----------------------------------------------------------------------
+    # Задача: Create missing Active Directory RoleGroups for Supermicro
+    # Создаём группы из inventory, которых нет среди текущих RoleGroups.
+
+    - name: Create missing Active Directory RoleGroups for Supermicro
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory/RoleGroups"
         method: POST
         body_format: json
         body:
-          RoleGroupName: "{{ ipmi_directory_group_name }}"
-          RoleGroupDomain: "{{ ipmi_directory_server }}"
-          RoleGroupPrivilege: "{{ ipmi_directory_role }}"
+          RoleGroupName: "{{ item.name }}"
+          RoleGroupDomain: "{{ item.domain }}"
+          RoleGroupPrivilege: "{{ item.privilege }}"
         status_code:
           - 200
           - 201
+          - 202
           - 204
+      loop: "{{ smc_ad_groups_to_create }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
       when:
         - ipmi_detected_type == 'supermicro'
-        - smc_ad_rolegroups.json['Members@odata.count'] | int == 0
-
+        - smc_ad_groups_to_create | length > 0
 
     # ----------------------------------------------------------------------
-    # Задача: Update Active Directory RoleGroup for Supermicro
-    # Обновляем первую существующую RoleGroup на Supermicro.
-    # Это нужно, если группа уже создана, но надо привести её имя/домен/права к нужному состоянию.
-    - name: Update Active Directory RoleGroup for Supermicro
+    # Задача: Update changed Active Directory RoleGroups for Supermicro
+    # Исправляем домен или привилегии существующих управляемых групп.
+
+    - name: Update changed Active Directory RoleGroups for Supermicro
       ansible.builtin.uri:
-        url: "{{ baseuri }}{{ smc_ad_rolegroups.json.Members[0]['@odata.id'] }}"
+        url: "{{ baseuri }}{{ item.uri }}"
         method: PATCH
         body_format: json
         body:
-          RoleGroupName: "{{ ipmi_directory_group_name }}"
-          RoleGroupDomain: "{{ ipmi_directory_server }}"
-          RoleGroupPrivilege: "{{ ipmi_directory_role }}"
+          RoleGroupName: "{{ item.name }}"
+          RoleGroupDomain: "{{ item.domain }}"
+          RoleGroupPrivilege: "{{ item.privilege }}"
         status_code:
           - 200
           - 204
-          - 302
+      loop: "{{ smc_ad_groups_to_update }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
       when:
         - ipmi_detected_type == 'supermicro'
-        - smc_ad_rolegroups.json['Members@odata.count'] | int > 0
+        - smc_ad_groups_to_update | length > 0
+
+    # ----------------------------------------------------------------------
+    # Задача: Verify final Supermicro Active Directory RoleGroups
+    # После удаления/создания/обновления повторно читаем коллекцию и требуем
+    # точного совпадения с группами, рассчитанными из inventory.
+    - name: Read final Active Directory RoleGroups for Supermicro
+      ansible.builtin.uri:
+        url: "{{ baseuri }}/redfish/v1/Managers/1/ActiveDirectory/RoleGroups"
+        method: GET
+      register: smc_ad_rolegroups_final
+      changed_when: false
+      when: ipmi_detected_type == 'supermicro'
+
+    - name: Read final Active Directory RoleGroup resources for Supermicro
+      ansible.builtin.uri:
+        url: "{{ baseuri }}{{ item['@odata.id'] }}"
+        method: GET
+      loop: "{{ smc_ad_rolegroups_final.json.Members | default([]) }}"
+      loop_control:
+        label: "{{ item['@odata.id'] }}"
+      register: smc_ad_rolegroup_final_reads
+      changed_when: false
+      when: ipmi_detected_type == 'supermicro'
+
+    - name: Initialize final Supermicro Active Directory RoleGroup list
+      ansible.builtin.set_fact:
+        smc_ad_final_groups: []
+      changed_when: false
+      when: ipmi_detected_type == 'supermicro'
+
+    - name: Build final Supermicro Active Directory RoleGroup list
+      ansible.builtin.set_fact:
+        smc_ad_final_groups: >-
+          {{
+            smc_ad_final_groups
+            +
+            [
+              {
+                'name': item.json.get('RoleGroupName', ''),
+                'domain': item.json.get('RoleGroupDomain', ''),
+                'privilege': item.json.get('RoleGroupPrivilege', '')
+              }
+            ]
+          }}
+      loop: "{{ smc_ad_rolegroup_final_reads.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item['@odata.id'] | default('unknown') }}"
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'supermicro'
+        - not (item.skipped | default(false))
+        - item.json is defined
+
+    - name: Validate final Supermicro Active Directory RoleGroups
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              smc_ad_final_groups
+              | sort(attribute='name')
+            )
+            ==
+            (
+              ipmi_desired_supermicro_role_groups
+              | sort(attribute='name')
+            )
+        fail_msg: >-
+          Supermicro {{ inventory_hostname }} не сохранил рассчитанный список
+          Active Directory RoleGroups.
+        quiet: true
+      when: ipmi_detected_type == 'supermicro'
 
     ###########################################################################
     # Reset
@@ -1298,7 +3026,8 @@
     # Задача: Reset HPE iLO5 after network and directory changes
     # Перезапускаем iLO5 после изменения сети, NTP и LDAP.
     # ResetType GracefulRestart перезапускает только iLO, не сам физический сервер.
-    - name: Reset HPE iLO5 after network and directory changes
+
+    - name: Reset HPE iLO5 after real configuration changes
       ansible.builtin.uri:
         url: >-
           {{ baseuri }}{{
@@ -1312,14 +3041,29 @@
           - 200
           - 202
           - 204
+      register: hpe_ilo5_reset
       changed_when: true
-      when: ipmi_detected_type == 'ilo5'
-
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - >
+          ilo5_network_apply.changed | default(false)
+          or hpe_ipv6_preferred_ribcl_ilo5.changed | default(false)
+          or hpe_ntp_dhcp_patch_ilo5.changed | default(false)
+          or hpe_ntp_dhcp_patch_fallback_ilo5.changed | default(false)
+          or hpe_ntp_dhcp_ribcl_ilo5.changed | default(false)
+          or ilo5_datetime_apply.changed | default(false)
+          or hpe_ca_delete_ilo5.changed | default(false)
+          or hpe_ca_import_ilo5.changed | default(false)
+          or ilo5_ldap_service_apply.changed | default(false)
+          or ilo5_ldap_context_apply.changed | default(false)
+          or ilo5_ldap_group_apply.changed | default(false)
+          or ilo5_ldap_role_apply.changed | default(false)
 
     # ----------------------------------------------------------------------
     # Задача: Wait for HPE iLO5 HTTPS after reset
     # Ждём, пока iLO5 снова откроет HTTPS после reset.
     # Это финальная пауза, чтобы не считать хост готовым раньше времени.
+
     - name: Wait for HPE iLO5 HTTPS after reset
       ansible.builtin.wait_for:
         host: "{{ inventory_hostname }}"
@@ -1327,30 +3071,34 @@
         delay: 25
         timeout: 180
         state: started
-      when: ipmi_detected_type == 'ilo5'
-
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - hpe_ilo5_reset.changed | default(false)
 
     # ----------------------------------------------------------------------
     # Задача: Verify HPE iLO5 Redfish after reset
     # Проверяем не только открытый TCP 443, но и готовность Redfish API.
+
     - name: Verify HPE iLO5 Redfish after reset
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/"
         method: GET
-        status_code: 200
       register: hpe_ilo5_redfish_ready
       retries: 12
       delay: 10
       until: hpe_ilo5_redfish_ready.status == 200
       changed_when: false
-      when: ipmi_detected_type == 'ilo5'
-
+      when:
+        - ipmi_detected_type == 'ilo5'
+        - hpe_ilo5_reset.changed | default(false)
 
     # ----------------------------------------------------------------------
     # Задача: Reset HPE iLO4 after RIBCL changes
     # Финально перезапускаем iLO4 после всех RIBCL/web изменений.
     # Это применяет Directory, Generic LDAP, SNTP и сетевые параметры iLO4.
-    - name: Reset HPE iLO4 after RIBCL changes
+
+    - name: Reset HPE iLO4 after real configuration changes
       ansible.builtin.uri:
         url: "{{ baseuri }}/ribcl"
         method: POST
@@ -1366,41 +3114,61 @@
               </RIB_INFO>
             </LOGIN>
           </RIBCL>
-        status_code:
-          - 200
-          - 500
+      register: hpe_ilo4_final_reset
       failed_when: false
       changed_when: true
       no_log: true
       when:
         - ipmi_detected_type == 'ilo4'
         - hpe_ilo4_reset_after_ribcl | bool
+        - >
+          hpe_dns_ribcl_ilo4.changed | default(false)
+          or hpe_sntp_ribcl_ilo4.changed | default(false)
+          or hpe_directory_ribcl_ilo4.changed | default(false)
+          or hpe_clear_user_context_ilo4.changed | default(false)
+          or hpe_ca_import_web_ilo4.changed | default(false)
+          or hpe_generic_ldap_ribcl_ilo4.changed | default(false)
 
+    # ----------------------------------------------------------------------
+    # Задача: Wait for HPE iLO4 HTTPS to stop after reset
+    # Проверяем, что команда RESET_RIB действительно запустила перезагрузку.
+    # Если HTTPS-порт не закроется, текущий хост завершается с FAILED.
+
+    - name: Wait for HPE iLO4 HTTPS to stop after reset
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
+        port: "{{ ipmi_https_port | int }}"
+        timeout: 60
+        state: stopped
+      changed_when: false
+      when:
+        - ipmi_detected_type == 'ilo4'
+        - hpe_ilo4_final_reset.changed | default(false)
 
     # ----------------------------------------------------------------------
     # Задача: Wait for HPE iLO4 HTTPS after reset
-    # Ждём, пока iLO4 снова поднимет HTTPS после финального reset.
-    # После этого iLO должен быть доступен для web/Redfish/RIBCL проверок.
+    # После подтверждённого отключения ждём повторного запуска HTTPS.
+
     - name: Wait for HPE iLO4 HTTPS after reset
       ansible.builtin.wait_for:
         host: "{{ inventory_hostname }}"
         port: "{{ ipmi_https_port | int }}"
-        delay: 20
+        delay: 5
         timeout: 180
         state: started
+      changed_when: false
       when:
         - ipmi_detected_type == 'ilo4'
-        - hpe_ilo4_reset_after_ribcl | bool
-
+        - hpe_ilo4_final_reset.changed | default(false)
 
     # ----------------------------------------------------------------------
     # Задача: Verify HPE iLO4 Redfish after reset
     # После финального reset проверяем, что Redfish API реально отвечает HTTP 200.
+
     - name: Verify HPE iLO4 Redfish after reset
       ansible.builtin.uri:
         url: "{{ baseuri }}/redfish/v1/"
         method: GET
-        status_code: 200
       register: hpe_ilo4_redfish_ready
       retries: 18
       delay: 10
@@ -1408,4 +3176,5 @@
       changed_when: false
       when:
         - ipmi_detected_type == 'ilo4'
-        - hpe_ilo4_reset_after_ribcl | bool
+        - hpe_ilo4_final_reset.changed | default(false)
+
